@@ -1,4 +1,42 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# Nextcloud Service Backup — Hosted via BackupPC
+#
+# This script is part of the *service backup strategy* integrating
+# container-based Nextcloud and MariaDB with BackupPC.
+#
+# Preconditions:
+#   • The user "backuppc" must be allowed to bind mount and unmount
+#     the service staging directory for BackupPC to treat it as a
+#     distinct backup source.
+#
+#   • The following sudoers rules must be in place (see doc/setup):
+#       backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services/ /srv/backuppc/services/
+#       backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/
+#
+#   • Required directories must exist prior to backup:
+#       sudo mkdir -p /export/mariadb/backuppc/services
+#       sudo chown -R backuppc:backuppc /export/mariadb/backuppc
+#
+#       sudo mkdir -p /srv/backuppc/services
+#       sudo chown -R backuppc:backuppc /srv/backuppc
+#
+#   • This script is invoked by BackupPC as a pre/post user command
+#     with uid=backuppc.
+#
+# Exit behavior:
+#   • On success: exit 0 (BackupPC marks job as success)
+#   • On failure: exit > 0 (BackupPC marks job as failure and triggers alerts)
+#
+# Logging:
+#   • Standard output and stderr are logged to a per-host service log.
+#
+# Note:
+#   This script is *not* a general host backup but a staging step for
+#   application-consistent service artifacts that BackupPC will ingest.
+#
+# =============================================================================
+
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 umask 077
