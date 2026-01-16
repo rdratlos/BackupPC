@@ -3,16 +3,20 @@
 # Nextcloud Service Backup — Hosted via BackupPC
 #
 # This script is part of the *service backup strategy* integrating
-# container-based Nextcloud and MariaDB with BackupPC.
+# Incus container-based services Nextcloud and MariaDB with BackupPC.
+#
+# Key paths:
+#   • Staging (scratch on fast storage): /export/mariadb/backuppc/services/<svc>
+#   • BackupPC view (bind mount):       /srv/backuppc/services/<svc>
 #
 # Preconditions:
 #   • The user "backuppc" must be allowed to bind mount and unmount
 #     the service staging directory for BackupPC to treat it as a
 #     distinct backup source.
 #
-#   • The following sudoers rules must be in place (see doc/setup):
-#       backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services/ /srv/backuppc/services/
-#       backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/
+#   • Sudoers (example drop-in under /etc/sudoers.d/backuppc-svc):
+#     backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services/ /srv/backuppc/services/
+#     backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/
 #
 #   • Required directories must exist prior to backup:
 #       sudo mkdir -p /export/mariadb/backuppc/services
@@ -66,27 +70,16 @@ FAILED=0
 FAIL_RC=0
 FAIL_MSG=""
 
-### SETUP ###
-mkdir -p "STAGING_DIR"/{db,app,meta,config,app-list,package-list,systemd-list}
+log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
 
-if [ ! -d "$(dirname "$LOGFILE")" ]; then
-    echo "[ERROR]  BackupPC log/lock directory  '$(dirname "$LOGFILE")' not found. Has BackupPC been installed? Aborting."
-    exit 1
-fi
-
-exec >>"$LOGFILE" 2>&1
-echo "==== PRE backup start: $(date -Is) ===="
-
-echo "Checking database availability"
-if ! mariadb-admin ping -h "$DB_HOST" --silent; then
-  echo "[ERROR]  Database host $DB_HOST not reachable, aborting"
-  exit 1
-fi
-
-exec 9>"$LOCKFILE"
-flock -n 9 || {
-  echo "[ERROR]  Another backup is running, aborting."
-  exit 1
+fail() {
+  local rc="$1"; shift
+  local msg="$*"
+  FAILED=1
+  FAIL_RC="$rc"
+  FAIL_MSG="phase=${PHASE} rc=${rc} msg=${msg}"
+  log "[ERROR] ${FAIL_MSG}"
+  exit "$rc"
 }
 
 ### Service bind mount functions ###
@@ -101,12 +94,10 @@ ensure_bind_mount() {
 
   if is_mounted "$dst"; then
     # If already mounted, verify it's the mount we expect.
-    # (Prevents accidentally backing up the wrong mounted filesystem.)
     local actual_src
     actual_src="$(findmnt -n -o SOURCE --target "$dst" 2>/dev/null || true)"
     if [[ "$actual_src" != "$src" ]]; then
-      log "[ERROR] $dst is already a mountpoint, but source differs (expected=$src actual=$actual_src)"
-      exit 20
+      fail 20 "$dst is already a mountpoint, but source differs (expected=$src actual=$actual_src)"
     fi
     log "[INFO] Bind mount already present: $src -> $dst"
     return 0
@@ -116,45 +107,33 @@ ensure_bind_mount() {
   sudo /usr/bin/mount --bind "$src" "$dst"
 }
 
-### Enterprise-ish directory cleanup function ###
+### Enterprise-ish directory cleanup function (wipe contents, keep dir) ###
 safe_wipe_dir_contents() {
   local dir="$1"
 
-  # Guardrails: refuse to run on empty/unsafe targets
   if [[ -z "${dir}" || "${dir}" == "/" || "${dir}" == "." ]]; then
-    echo "[ERROR] Refusing to wipe unsafe dir='${dir}'"
-    return 2
+    fail 30 "Refusing to wipe unsafe dir='${dir}'"
   fi
   if [[ ! -d "${dir}" ]]; then
-    echo "[ERROR] Directory not found: ${dir}"
-    return 2
+    fail 31 "Directory not found: ${dir}"
   fi
 
-  echo "[INFO] Preparing to wipe contents of: ${dir}"
+  log "[INFO] Preparing to wipe contents of: ${dir}"
 
-  # 1) Make directories deletable: owner needs +w and +x on dirs
-  # -mindepth 1 ensures we don't chmod the root dir itself unless you want to.
-  # -xdev avoids crossing filesystem boundaries if there are mounts under it.
-  # chmod on directories is sufficient; we do not need to chmod files/symlinks.
+  # Make subdirectories deletable (owner needs +w +x on dirs)
   find "${dir}" -xdev -mindepth 1 -type d -exec chmod u+wx {} + || true
 
-  # Optional: if you have ACLs that might deny deletion, you can also clear ACLs.
-  # (Only enable if ACLs are in play; otherwise keep it simple.)
-  # find "${dir}" -xdev -mindepth 1 -type d -exec setfacl -b {} + || true
-
-  # 2) Now wipe everything under it
+  # Remove everything under it (including dotfiles via dotglob)
+  local olddotglob oldnullglob
+  olddotglob=$(shopt -p dotglob); oldnullglob=$(shopt -p nullglob)
+  shopt -s dotglob nullglob
   rm -rf --one-file-system -- "${dir:?}/"*
+  eval "$olddotglob"; eval "$oldnullglob"
 }
 
-### ERROR AND CLEANUP HANDLER ###
-log() {
-  # ISO timestamps are easiest to correlate in centralized logs
-  printf '[%s] %s\n' "$(date -Is)" "$*"
-}
-
+### ERROR AND CLEANUP HANDLERS ###
 on_err() {
   local rc=$?
-  # If we already captured a failure, don't overwrite it
   if [[ "$FAILED" -eq 0 ]]; then
     FAILED=1
     FAIL_RC="$rc"
@@ -163,20 +142,16 @@ on_err() {
   else
     log "[ERROR] additional error: phase=${PHASE} rc=${rc} line=${BASH_LINENO[0]} cmd=${BASH_COMMAND}"
   fi
-  # Let the script continue to EXIT trap for cleanup
   return "$rc"
 }
 
 cleanup() {
-  # Your existing cleanup operations go here.
-  # IMPORTANT: cleanup must not call "exit" directly.
   log "[INFO] Cleanup triggered"
 
-  # Disable maintenance mode best-effort — but if it fails, that should be visible
+  # Always try to disable maintenance mode (pre script must not leave service in maintenance)
   if [[ -n "${APP_CT:-}" ]]; then
     if ! incus exec "$APP_CT" -- occ maintenance:mode --off; then
       log "[ERROR] cleanup: failed to disable maintenance mode (container=${APP_CT})"
-      # If there was no earlier failure, mark cleanup failure as failure of the run
       if [[ "$FAILED" -eq 0 ]]; then
         FAILED=1
         FAIL_RC=90
@@ -187,7 +162,6 @@ cleanup() {
     fi
   else
     log "[WARN] cleanup: APP_CT not set, cannot disable maintenance mode"
-    # You can decide whether this should fail the run; I'd treat it as failure:
     if [[ "$FAILED" -eq 0 ]]; then
       FAILED=1
       FAIL_RC=91
@@ -199,26 +173,53 @@ cleanup() {
 }
 
 on_exit() {
-  local rc=$?  # rc at script end (may be 0 even if we recorded an error)
-  # Always attempt cleanup
+  local rc=$?
+
   cleanup
 
-  # Enforce failure if any phase reported failure (or cleanup marked it)
   if [[ "$FAILED" -ne 0 ]]; then
     log "[ERROR] Pre-backup failed: ${FAIL_MSG:-unknown error}"
-    echo "==== PRE backup failed at $(date -Is) ===="
+    log "==== PRE backup failed ===="
     exit "${FAIL_RC:-1}"
   fi
 
-  # Otherwise exit with original rc (should be 0)
-  echo "==== PRE backup completed successfully at $(date -Is) ===="
+  log "==== PRE backup completed successfully ===="
   exit "$rc"
 }
 
 trap on_err ERR
 trap on_exit EXIT
 
-### 1. Check and Prepare Bind Mounts for BackupPC ###
+### SETUP ###
+if [[ ! -d "$(dirname "$LOGFILE")" ]]; then
+  echo "[ERROR] BackupPC log/lock directory '$(dirname "$LOGFILE")' not found. Has BackupPC been installed? Aborting." >&2
+  exit 1
+fi
+
+exec >>"$LOGFILE" 2>&1
+log "==== PRE backup start ===="
+
+# Lock to avoid overlapping runs
+exec 9>"$LOCKFILE"
+flock -n 9 || fail 2 "Another backup is running (lock=$LOCKFILE)"
+
+PHASE="db_ping"
+log "Checking database availability"
+if ! mariadb-admin ping -h "$DB_HOST" --silent; then
+  fail 3 "Database host $DB_HOST not reachable"
+fi
+
+# Prepare directory layout
+PHASE="prepare_dirs"
+mkdir -p -- "${STAGING_DIR}"/{db,app,meta,config,app-list,package-list,systemd-list}
+
+# Record run metadata early
+PHASE="meta_start"
+RUN_ID="$(date -Is | tr ':' '-')"
+printf '%s\n' "$RUN_ID" > "${STAGING_DIR}/meta/run_id"
+date -Is > "${STAGING_DIR}/meta/started_at"
+
+### 1. Ensure bind mount exists for BackupPC view ###
 PHASE="bind_mount_prepare"
 ensure_bind_mount "$STAGING_DIR" "$VIEW_DIR"
 
@@ -230,7 +231,8 @@ incus exec "$APP_CT" -- occ maintenance:mode --on
 ### 3. Dump MariaDB ###
 PHASE="db_dump"
 log "Dumping database"
-DB_FILE="STAGING_DIR/db/mariadb.sql.zst"
+DB_FILE="${STAGING_DIR}/db/mariadb.sql.zst"
+
 mariadb-dump \
   --single-transaction \
   --routines \
@@ -243,34 +245,35 @@ mariadb-dump \
 
 ### 4. Backup Nextcloud configuration (/etc) ###
 PHASE="etc_backup"
-log "Backing up container configuration (/etc)..."
-CONFIG_DIR="STAGING_DIR/config"
+log "Backing up container configuration (/etc)"
+CONFIG_DIR="${STAGING_DIR}/config"
 # Clean old extracted folder before extracting (robust against non-writable dirs)
 safe_wipe_dir_contents "$CONFIG_DIR"
 incus exec "$APP_CT" -- tar cf - -C / etc | tar xf - -C "$CONFIG_DIR"
 
 ### 5. Backup Nextcloud app list ###
 PHASE="nc_app_list_dump"
-log "Backing up Nextcloud app list..."
-APP_LIST_FILE="STAGING_DIR/app-list/apps.txt"
+log "Backing up Nextcloud app list"
+APP_LIST_FILE="${STAGING_DIR}/app-list/apps.txt"
 incus exec "$APP_CT" -- occ app:list > "$APP_LIST_FILE"
 
 ### 6. Capture Nextcloud state ###
 PHASE="nc_state_dump"
-log "Capturing Nextcloud state..."
-incus exec "$APP_CT" -- occ status > "STAGING_DIR/app/occ-status.txt"
+log "Capturing Nextcloud state"
+incus exec "$APP_CT" -- occ status > "${STAGING_DIR}/app/occ-status.txt"
 
 ### 7. Capture Manjaro package lists ###
 PHASE="package_list_dump"
-log "Capturing Manjaro package lists..."
-incus exec "$APP_CT" -- pacman -Qqen > "STAGING_DIR/package-list/pkglist-repo.txt"
-incus exec "$APP_CT" -- pacman -Qqem > "STAGING_DIR/package-list/pkglist-aur.txt"
-incus exec "$APP_CT" -- pacman -Qe   > "STAGING_DIR/package-list/pkg-versions.txt"
+log "Capturing Manjaro package lists"
+incus exec "$APP_CT" -- pacman -Qqen > "${STAGING_DIR}/package-list/pkglist-repo.txt"
+incus exec "$APP_CT" -- pacman -Qqem > "${STAGING_DIR}/package-list/pkglist-aur.txt"
+incus exec "$APP_CT" -- pacman -Qe   > "${STAGING_DIR}/package-list/pkg-versions.txt"
 
-### 8. Capture Systemd Service lists ###
+### 8. Capture Systemd service list ###
 PHASE="systemd_service_dump"
-log "Capturing Systemd service lists..."
-incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled > "STAGING_DIR/systemd-list/systemd-enabled.txt"
+log "Capturing Systemd enabled services"
+incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled > "${STAGING_DIR}/systemd-list/systemd-enabled.txt"
 
-### 9. Timestamp ###
-date -Is > "STAGING_DIR/meta/started_at"
+# Pre script ends; EXIT trap will disable maintenance mode.
+PHASE="done"
+log "Pre script main flow done"
