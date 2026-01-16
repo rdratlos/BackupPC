@@ -1,2 +1,2 @@
 # BackupPC
-Extend BackupPC to support servioce-centric backups
+Extend BackupPC to support service-centric backups
