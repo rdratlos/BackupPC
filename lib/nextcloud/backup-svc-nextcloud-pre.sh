@@ -46,7 +46,14 @@ APP_CT="nextcloud-server"
 DB_HOST="minerva.nepomuc.de"
 DB_NAME="nextcloud"
 BACKUP_USER="BackupOp"
-BACKUP_ROOT="/export/mariadb/backups/nextcloud"
+
+# --- Service bind-mount configuration ---
+SERVICE_NAME="nextcloud"
+STAGING_ROOT="/export/mariadb/backuppc/services"
+VIEW_ROOT="/srv/backuppc/services"
+
+STAGING_DIR="${STAGING_ROOT}/${SERVICE_NAME}"
+VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
 
 LOCKFILE="/var/log/backuppc/LOCK.svc-nextcloud"
 LOGFILE="/var/log/backuppc/svc-nextcloud-pre.log"
@@ -60,7 +67,8 @@ FAIL_RC=0
 FAIL_MSG=""
 
 ### SETUP ###
-mkdir -p "$BACKUP_ROOT"/{db,app,meta,config,app-list,package-list,systemd-list}
+mkdir -p "STAGING_DIR"/{db,app,meta,config,app-list,package-list,systemd-list}
+
 if [ ! -d "$(dirname "$LOGFILE")" ]; then
     echo "[ERROR]  BackupPC log/lock directory  '$(dirname "$LOGFILE")' not found. Has BackupPC been installed? Aborting."
     exit 1
@@ -79,6 +87,33 @@ exec 9>"$LOCKFILE"
 flock -n 9 || {
   echo "[ERROR]  Another backup is running, aborting."
   exit 1
+}
+
+### Service bind mount functions ###
+is_mounted() {
+  mountpoint -q -- "$1"
+}
+
+ensure_bind_mount() {
+  local src="$1" dst="$2"
+
+  mkdir -p -- "$src" "$dst"
+
+  if is_mounted "$dst"; then
+    # If already mounted, verify it's the mount we expect.
+    # (Prevents accidentally backing up the wrong mounted filesystem.)
+    local actual_src
+    actual_src="$(findmnt -n -o SOURCE --target "$dst" 2>/dev/null || true)"
+    if [[ "$actual_src" != "$src" ]]; then
+      log "[ERROR] $dst is already a mountpoint, but source differs (expected=$src actual=$actual_src)"
+      exit 20
+    fi
+    log "[INFO] Bind mount already present: $src -> $dst"
+    return 0
+  fi
+
+  log "[INFO] Creating bind mount: $src -> $dst"
+  sudo /usr/bin/mount --bind "$src" "$dst"
 }
 
 ### Enterprise-ish directory cleanup function ###
@@ -183,15 +218,19 @@ on_exit() {
 trap on_err ERR
 trap on_exit EXIT
 
-### 1. Enable maintenance mode ###
+### 1. Check and Prepare Bind Mounts for BackupPC ###
+PHASE="bind_mount_prepare"
+ensure_bind_mount "$STAGING_DIR" "$VIEW_DIR"
+
+### 2. Enable maintenance mode ###
 PHASE="maintenance_on"
 log "Enabling maintenance mode"
 incus exec "$APP_CT" -- occ maintenance:mode --on
 
-### 2. Dump MariaDB ###
+### 3. Dump MariaDB ###
 PHASE="db_dump"
 log "Dumping database"
-DB_FILE="$BACKUP_ROOT/db/mariadb.sql.zst"
+DB_FILE="STAGING_DIR/db/mariadb.sql.zst"
 mariadb-dump \
   --single-transaction \
   --routines \
@@ -202,36 +241,36 @@ mariadb-dump \
   "$DB_NAME" \
 | zstd -19 -T0 > "$DB_FILE"
 
-### 3. Backup Nextcloud configuration (/etc) ###
+### 4. Backup Nextcloud configuration (/etc) ###
 PHASE="etc_backup"
 log "Backing up container configuration (/etc)..."
-CONFIG_DIR="$BACKUP_ROOT/config"
+CONFIG_DIR="STAGING_DIR/config"
 # Clean old extracted folder before extracting (robust against non-writable dirs)
 safe_wipe_dir_contents "$CONFIG_DIR"
 incus exec "$APP_CT" -- tar cf - -C / etc | tar xf - -C "$CONFIG_DIR"
 
-### 4. Backup Nextcloud app list ###
+### 5. Backup Nextcloud app list ###
 PHASE="nc_app_list_dump"
 log "Backing up Nextcloud app list..."
-APP_LIST_FILE="$BACKUP_ROOT/app-list/apps.txt"
+APP_LIST_FILE="STAGING_DIR/app-list/apps.txt"
 incus exec "$APP_CT" -- occ app:list > "$APP_LIST_FILE"
 
-### 5. Capture Nextcloud state ###
+### 6. Capture Nextcloud state ###
 PHASE="nc_state_dump"
 log "Capturing Nextcloud state..."
-incus exec "$APP_CT" -- occ status > "$BACKUP_ROOT/app/occ-status.txt"
+incus exec "$APP_CT" -- occ status > "STAGING_DIR/app/occ-status.txt"
 
-### 6. Capture Manjaro package lists ###
+### 7. Capture Manjaro package lists ###
 PHASE="package_list_dump"
 log "Capturing Manjaro package lists..."
-incus exec "$APP_CT" -- pacman -Qqen > "$BACKUP_ROOT/package-list/pkglist-repo.txt"
-incus exec "$APP_CT" -- pacman -Qqem > "$BACKUP_ROOT/package-list/pkglist-aur.txt"
-incus exec "$APP_CT" -- pacman -Qe   > "$BACKUP_ROOT/package-list/pkg-versions.txt"
+incus exec "$APP_CT" -- pacman -Qqen > "STAGING_DIR/package-list/pkglist-repo.txt"
+incus exec "$APP_CT" -- pacman -Qqem > "STAGING_DIR/package-list/pkglist-aur.txt"
+incus exec "$APP_CT" -- pacman -Qe   > "STAGING_DIR/package-list/pkg-versions.txt"
 
-### 7. Capture Systemd Service lists ###
+### 8. Capture Systemd Service lists ###
 PHASE="systemd_service_dump"
 log "Capturing Systemd service lists..."
-incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled > "$BACKUP_ROOT/systemd-list/systemd-enabled.txt"
+incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled > "STAGING_DIR/systemd-list/systemd-enabled.txt"
 
-### 8. Timestamp ###
-date -Is > "$BACKUP_ROOT/meta/started_at"
+### 9. Timestamp ###
+date -Is > "STAGING_DIR/meta/started_at"

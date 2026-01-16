@@ -42,12 +42,18 @@ shopt -s inherit_errexit 2>/dev/null || true
 umask 077
 
 APP_CT="nextcloud-server"
-BACKUP_ROOT="/export/mariadb/backups/nextcloud"
 LOGFILE="/var/log/backuppc/svc-nextcloud-post.log"
 
 # Remove full staging on success (recommended for your model).
 # Set to 0 if you ever want to keep artifacts on the host after success.
 CLEANUP_ALL_ON_SUCCESS=1
+
+# --- Service bind-mount configuration ---
+SERVICE_NAME="nextcloud"
+STAGING_ROOT="/export/mariadb/backuppc/services"
+VIEW_ROOT="/srv/backuppc/services"
+STAGING_DIR="${STAGING_ROOT}/${SERVICE_NAME}"
+VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
 
 # BackupPC sets xferOK for post commands. If unset, treat as failure.
 XFER_OK="${xferOK:-0}"
@@ -137,7 +143,7 @@ cleanup() {
 
   # Always remove temporary config directory (it is staging-only).
   PHASE="cleanup_remove_config"
-  if ! safe_remove_dir "${BACKUP_ROOT}/config"; then
+  if ! safe_remove_dir "${STAGING_DIR}/config"; then
     log "[ERROR] cleanup: failed to remove temporary config directory"
     if [[ "$FAILED" -eq 0 ]]; then
       FAILED=1
@@ -153,16 +159,16 @@ on_exit() {
   local rc=$?
 
   # Always try to write finished_at (best effort)
-  mkdir -p -- "${BACKUP_ROOT}/meta" || true
-  date -Is > "${BACKUP_ROOT}/meta/finished_at" || true
+  mkdir -p -- "${STAGING_DIR}/meta" || true
+  date -Is > "${STAGING_DIR}/meta/finished_at" || true
 
   # Always run cleanup (must restore service state & remove config staging)
   cleanup
 
   # If the script itself failed, fail the backup and keep artifacts for debugging (except config/).
   if [[ "$FAILED" -ne 0 ]]; then
-    printf 'failed\n' > "${BACKUP_ROOT}/meta/status" 2>/dev/null || true
-    printf '%s\n' "${FAIL_MSG:-unknown error}" > "${BACKUP_ROOT}/meta/error" 2>/dev/null || true
+    printf 'failed\n' > "${STAGING_DIR}/meta/status" 2>/dev/null || true
+    printf '%s\n' "${FAIL_MSG:-unknown error}" > "${STAGING_DIR}/meta/error" 2>/dev/null || true
     log "[ERROR] POST backup failed: ${FAIL_MSG:-unknown error}"
     log "==== POST backup failed ===="
     exit "${FAIL_RC:-1}"
@@ -171,32 +177,58 @@ on_exit() {
   # Script checks passed; now enforce BackupPC transfer success
   if [[ "${XFER_OK}" -ne 1 ]]; then
     # Transfer failed: fail job so GUI shows failure; keep artifacts for debugging (except config/).
-    printf 'failed\n' > "${BACKUP_ROOT}/meta/status" 2>/dev/null || true
+    printf 'failed\n' > "${STAGING_DIR}/meta/status" 2>/dev/null || true
     printf 'xferOK=%s: BackupPC transfer failed; keeping artifacts for debugging\n' "${XFER_OK}" \
-      > "${BACKUP_ROOT}/meta/error" 2>/dev/null || true
+      > "${STAGING_DIR}/meta/error" 2>/dev/null || true
     log "[ERROR] BackupPC transfer failed (xferOK=${XFER_OK}); keeping artifacts (except config/) for debugging"
     log "==== POST backup failed (xfer) ===="
     exit 100
   fi
 
   # All good: checks ok and transfer ok
-  printf 'ok\n' > "${BACKUP_ROOT}/meta/status" 2>/dev/null || true
+  printf 'ok\n' > "${STAGING_DIR}/meta/status" 2>/dev/null || true
   log "[INFO] All checks OK and BackupPC transfer OK (xferOK=1)"
 
   if [[ "${CLEANUP_ALL_ON_SUCCESS}" -eq 1 ]]; then
     PHASE="cleanup_remove_all"
-    log "[INFO] Removing staging directory (success policy): ${BACKUP_ROOT}"
+    log "[INFO] Removing staging directory (success policy): ${STAGING_DIR}"
     # Best effort: if this fails, mark as failure (admins should notice)
-    if ! safe_remove_dir "${BACKUP_ROOT}"; then
-      log "[ERROR] Failed to remove BACKUP_ROOT on success: ${BACKUP_ROOT}"
+    if ! safe_remove_dir "${STAGING_DIR}"; then
+      log "[ERROR] Failed to remove STAGING_DIR on success: ${STAGING_DIR}"
       exit 101
     fi
   else
-    log "[INFO] Success policy: leaving staging directory on host: ${BACKUP_ROOT}"
+    log "[INFO] Success policy: leaving staging directory on host: ${STAGING_DIR}"
   fi
 
   log "==== POST backup completed successfully ===="
   exit 0
+}
+
+# --- Service bind-mount functions ---
+is_mounted() {
+  mountpoint -q -- "$1"
+}
+
+safe_unmount_view() {
+  local dst="$1"
+  if is_mounted "$dst"; then
+    log "[INFO] Unmounting bind mount: $dst"
+    # Use sudoers-allowed umount
+    sudo /usr/bin/umount "$dst"
+  else
+    log "[INFO] Not mounted (skip umount): $dst"
+  fi
+}
+
+safe_remove_dir() {
+  local dir="$1"
+  [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]] || return 2
+  [[ -d "$dir" ]] || return 0
+
+  log "[INFO] Removing directory: $dir"
+  find "$dir" -xdev -mindepth 1 -type d -exec chmod u+wx {} + || true
+  rm -rf --one-file-system -- "${dir:?}"
 }
 
 trap on_err ERR
@@ -210,7 +242,7 @@ incus exec "$APP_CT" -- occ maintenance:mode --off
 
 PHASE="db_dump_check"
 log "[INFO] Verifying database dump integrity"
-DUMP="${BACKUP_ROOT}/db/mariadb.sql.zst"
+DUMP="${STAGING_DIR}/db/mariadb.sql.zst"
 
 if [[ ! -s "$DUMP" ]]; then
   fail 10 "DB dump missing or empty: $DUMP"
