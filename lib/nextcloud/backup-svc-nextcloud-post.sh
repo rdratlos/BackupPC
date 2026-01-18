@@ -2,8 +2,19 @@
 # =============================================================================
 # Nextcloud Service Backup — Hosted via BackupPC
 #
-# This script is part of the *service backup strategy* integrating
-# container-based Nextcloud and MariaDB with BackupPC.
+# Post hook for BackupPC *service backups* integrating
+# Incus container-based Nextcloud and MariaDB with BackupPC.
+#
+# Responsibilities:
+#   • Restore service operation (disable maintenance mode)
+#   • Validate staged artifacts (e.g., DB dump integrity)
+#   • Record meta information (status, error, timestamps, xferOK)
+#   • On success: unmount BackupPC view and remove staging
+#   • On failure or xferOK!=1: keep bind mount + staging as evidence
+#
+# Key paths:
+#   • Staging (scratch): /export/mariadb/backuppc/services/<svc>
+#   • BackupPC view:    /srv/backuppc/services/<svc>
 #
 # Preconditions:
 #   • The user "backuppc" must be allowed to bind mount and unmount
@@ -21,7 +32,7 @@
 #       sudo mkdir -p /srv/backuppc/services
 #       sudo chown -R backuppc:backuppc /srv/backuppc
 #
-#   • This script is invoked by BackupPC as a pre/post user command
+#   • This script is invoked by BackupPC as a post user command
 #     with uid=backuppc.
 #
 # Exit behavior:
@@ -41,66 +52,32 @@ set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 umask 077
 
+### CONFIG ###
 APP_CT="nextcloud-server"
-LOGFILE="/var/log/backuppc/svc-nextcloud-post.log"
-
-# Remove full staging on success (recommended for your model).
-# Set to 0 if you ever want to keep artifacts on the host after success.
-CLEANUP_ALL_ON_SUCCESS=1
-
-# --- Service bind-mount configuration ---
 SERVICE_NAME="nextcloud"
 STAGING_ROOT="/export/mariadb/backuppc/services"
 VIEW_ROOT="/srv/backuppc/services"
+
 STAGING_DIR="${STAGING_ROOT}/${SERVICE_NAME}"
 VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
+
+LOGFILE="/var/log/backuppc/svc-nextcloud-post.log"
 
 # BackupPC sets xferOK for post commands. If unset, treat as failure.
 XFER_OK="${xferOK:-0}"
 
-# ---- Logging setup ----
+### LOGGING SETUP ###
 mkdir -p -- "$(dirname -- "$LOGFILE")"
 exec >>"$LOGFILE" 2>&1
 
 log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
-
-log "==== POST backup start ===="
-log "[INFO] BackupPC xferOK=${XFER_OK}"
 
 PHASE="init"
 FAILED=0
 FAIL_RC=0
 FAIL_MSG=""
 
-# ---- Robust directory removal (remove directory itself) ----
-safe_remove_dir() {
-  local dir="$1"
-
-  # Guardrails
-  if [[ -z "${dir}" || "${dir}" == "/" || "${dir}" == "." ]]; then
-    log "[ERROR] Refusing to remove unsafe dir='${dir}'"
-    return 2
-  fi
-
-  # If it doesn't exist, treat as OK (idempotent)
-  if [[ ! -e "${dir}" ]]; then
-    log "[INFO] Directory does not exist (nothing to remove): ${dir}"
-    return 0
-  fi
-
-  if [[ ! -d "${dir}" ]]; then
-    log "[ERROR] Path exists but is not a directory: ${dir}"
-    return 2
-  fi
-
-  log "[INFO] Removing directory: ${dir}"
-
-  # Make subdirectories deletable (this is what bit you with cadir)
-  find "${dir}" -xdev -mindepth 1 -type d -exec chmod u+wx {} + || true
-
-  # Remove the directory itself
-  rm -rf --one-file-system -- "${dir:?}"
-}
+META_DIR="${STAGING_DIR}/meta"
 
 fail() {
   local rc="$1"; shift
@@ -125,6 +102,101 @@ on_err() {
   return "$rc"
 }
 
+# Remove directory (best-effort permission fix for deletability)
+safe_remove_dir() {
+  local dir="$1"
+
+  if [[ -z "${dir}" || "${dir}" == "/" || "${dir}" == "." ]]; then
+    log "[ERROR] Refusing to remove unsafe dir='${dir}'"
+    return 2
+  fi
+
+  [[ -e "$dir" ]] || return 0
+  [[ -d "$dir" ]] || { log "[ERROR] Path exists but is not a directory: $dir"; return 2; }
+
+  find "$dir" -xdev -mindepth 1 -type d -exec chmod u+wx {} + || true
+  rm -rf --one-file-system -- "${dir:?}"
+}
+
+# BIND MOUNT CLEANUP
+# ------------------
+# Unmounts DEST only if it is a direct mount point.
+# If DEST is accessible via parent mount, leave it alone (not our responsibility).
+# If mount is busy, logs warning and returns success (intentional for failure investigation).
+#
+# Exit codes:
+#   0  - Mount cleaned up OR not a direct mount OR busy (all acceptable states)
+remove_bind_mount() {
+  local dst="${1:-}"
+
+  if [[ -z "$dst" ]]; then
+    log "[ERROR] remove_bind_mount requires destination parameter"
+    return 0  # Don't fail the whole post-script for parameter error
+  fi
+
+  local dst_resolved=""
+  dst_resolved=$(realpath "$dst" 2>/dev/null) || true
+
+  if [[ -z "$dst_resolved" || ! -d "$dst_resolved" ]]; then
+    log "[WARN] Destination not accessible: $dst (already cleaned up?)"
+    return 0
+  fi
+
+  # Check if DEST is itself a mount point
+  local actual=""
+  actual=$(findmnt -n -o SOURCE --mountpoint "$dst_resolved" 2>/dev/null) || true
+
+  if [[ -z "$actual" ]]; then
+    # Not a direct mount point — check if accessible via parent
+    local via_parent=""
+    via_parent=$(findmnt -n -o SOURCE --target "$dst_resolved" 2>/dev/null) || true
+
+    if [[ -n "$via_parent" ]]; then
+      log "[INFO] $dst accessible via parent mount, not a direct mount point — skipping"
+    else
+      log "[INFO] $dst is not mounted — nothing to unmount"
+    fi
+    return 0
+  fi
+
+  # DEST is a direct mount point — unmount it
+  log "[INFO] Unmounting bind mount: $dst"
+  if ! sudo /usr/bin/umount "$dst"; then
+    log "[WARN] Cannot unmount $dst — mount is busy or in use"
+    log "[WARN] This may be intentional (failed backup investigation) or another process"
+    log "[WARN] findmnt output:"
+    log "[WARN]   $(findmnt -o SOURCE,TARGET,FSTYPE,OPTIONS --mountpoint "$dst_resolved" 2>/dev/null || echo 'n/a')"
+    log "[WARN] Open files:"
+    log "[WARN]   $(sudo lsof +f -- "$dst_resolved" 2>/dev/null | head -10 || echo 'n/a')"
+    return 0
+  fi
+
+  log "[INFO] Bind mount removed successfully"
+  return 0
+}
+
+write_meta_always() {
+  # Best effort; never fail the script just because meta couldn't be written.
+  mkdir -p -- "$META_DIR" 2>/dev/null || true
+  printf '%s\n' "$XFER_OK" > "${META_DIR}/xferOK" 2>/dev/null || true
+  date -Is > "${META_DIR}/finished_at" 2>/dev/null || true
+}
+
+write_meta_status() {
+  local status="$1"; shift
+  local err_msg="$*"
+
+  mkdir -p -- "$META_DIR" 2>/dev/null || true
+  printf '%s\n' "$status" > "${META_DIR}/status" 2>/dev/null || true
+
+  if [[ "$status" == "ok" ]]; then
+    # Clear stale error (optional)
+    : > "${META_DIR}/error" 2>/dev/null || true
+  else
+    printf '%s\n' "$err_msg" > "${META_DIR}/error" 2>/dev/null || true
+  fi
+}
+
 cleanup() {
   log "[INFO] Cleanup triggered (phase=${PHASE})"
 
@@ -141,7 +213,7 @@ cleanup() {
     log "[INFO] Maintenance mode disabled"
   fi
 
-  # Always remove temporary config directory (it is staging-only).
+  # Always remove temporary config snapshot (staging-only, safe to delete even on failure)
   PHASE="cleanup_remove_config"
   if ! safe_remove_dir "${STAGING_DIR}/config"; then
     log "[ERROR] cleanup: failed to remove temporary config directory"
@@ -155,86 +227,71 @@ cleanup() {
   log "[INFO] Cleanup finished"
 }
 
+finalize_mount_and_staging() {
+  # Policy:
+  #   • If FAILED != 0 OR xferOK != 1: keep bind mount + staging for evidence
+  #   • If success AND xferOK == 1: unmount view + remove full staging
+
+  if [[ "$FAILED" -ne 0 ]]; then
+    log "[WARN] Failure detected; preserving bind mount + staging for evidence: view=${VIEW_DIR} staging=${STAGING_DIR}"
+    return 0
+  fi
+
+  if [[ "$XFER_OK" -ne 1 ]]; then
+    log "[WARN] BackupPC transfer failed (xferOK=${XFER_OK}); preserving bind mount + staging for evidence: view=${VIEW_DIR} staging=${STAGING_DIR}"
+    return 0
+  fi
+
+  # Success
+  PHASE="cleanup_success"
+  remove_bind_mount "$VIEW_ROOT"
+  if ! safe_remove_dir "$STAGING_DIR"; then
+    # This should be visible as a failure in BackupPC GUI
+    fail 101 "Failed to remove staging directory on success: ${STAGING_DIR}"
+  fi
+  # Optional: remove empty view dir
+  rmdir "$VIEW_DIR" 2>/dev/null || true
+}
+
 on_exit() {
   local rc=$?
 
-  # Always try to write finished_at (best effort)
-  mkdir -p -- "${STAGING_DIR}/meta" || true
-  date -Is > "${STAGING_DIR}/meta/finished_at" || true
+  write_meta_always
 
-  # Always run cleanup (must restore service state & remove config staging)
   cleanup
 
-  # If the script itself failed, fail the backup and keep artifacts for debugging (except config/).
   if [[ "$FAILED" -ne 0 ]]; then
-    printf 'failed\n' > "${STAGING_DIR}/meta/status" 2>/dev/null || true
-    printf '%s\n' "${FAIL_MSG:-unknown error}" > "${STAGING_DIR}/meta/error" 2>/dev/null || true
+    write_meta_status "failed" "${FAIL_MSG:-unknown error}"
     log "[ERROR] POST backup failed: ${FAIL_MSG:-unknown error}"
+    finalize_mount_and_staging
     log "==== POST backup failed ===="
     exit "${FAIL_RC:-1}"
   fi
 
-  # Script checks passed; now enforce BackupPC transfer success
-  if [[ "${XFER_OK}" -ne 1 ]]; then
-    # Transfer failed: fail job so GUI shows failure; keep artifacts for debugging (except config/).
-    printf 'failed\n' > "${STAGING_DIR}/meta/status" 2>/dev/null || true
-    printf 'xferOK=%s: BackupPC transfer failed; keeping artifacts for debugging\n' "${XFER_OK}" \
-      > "${STAGING_DIR}/meta/error" 2>/dev/null || true
-    log "[ERROR] BackupPC transfer failed (xferOK=${XFER_OK}); keeping artifacts (except config/) for debugging"
+  if [[ "$XFER_OK" -ne 1 ]]; then
+    write_meta_status "failed" "xferOK=${XFER_OK}: BackupPC transfer failed; preserving evidence"
+    log "[ERROR] BackupPC transfer failed (xferOK=${XFER_OK}); preserving evidence"
+    finalize_mount_and_staging
     log "==== POST backup failed (xfer) ===="
     exit 100
   fi
 
-  # All good: checks ok and transfer ok
-  printf 'ok\n' > "${STAGING_DIR}/meta/status" 2>/dev/null || true
+  write_meta_status "ok"
   log "[INFO] All checks OK and BackupPC transfer OK (xferOK=1)"
 
-  if [[ "${CLEANUP_ALL_ON_SUCCESS}" -eq 1 ]]; then
-    PHASE="cleanup_remove_all"
-    log "[INFO] Removing staging directory (success policy): ${STAGING_DIR}"
-    # Best effort: if this fails, mark as failure (admins should notice)
-    if ! safe_remove_dir "${STAGING_DIR}"; then
-      log "[ERROR] Failed to remove STAGING_DIR on success: ${STAGING_DIR}"
-      exit 101
-    fi
-  else
-    log "[INFO] Success policy: leaving staging directory on host: ${STAGING_DIR}"
-  fi
+  finalize_mount_and_staging
 
   log "==== POST backup completed successfully ===="
   exit 0
 }
 
-# --- Service bind-mount functions ---
-is_mounted() {
-  mountpoint -q -- "$1"
-}
-
-safe_unmount_view() {
-  local dst="$1"
-  if is_mounted "$dst"; then
-    log "[INFO] Unmounting bind mount: $dst"
-    # Use sudoers-allowed umount
-    sudo /usr/bin/umount "$dst"
-  else
-    log "[INFO] Not mounted (skip umount): $dst"
-  fi
-}
-
-safe_remove_dir() {
-  local dir="$1"
-  [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]] || return 2
-  [[ -d "$dir" ]] || return 0
-
-  log "[INFO] Removing directory: $dir"
-  find "$dir" -xdev -mindepth 1 -type d -exec chmod u+wx {} + || true
-  rm -rf --one-file-system -- "${dir:?}"
-}
-
 trap on_err ERR
 trap on_exit EXIT
 
-# ---- Main flow ----
+log "==== POST backup start ===="
+log "[INFO] BackupPC xferOK=${XFER_OK}"
+
+### MAIN FLOW ###
 
 PHASE="maintenance_off"
 log "[INFO] Disabling maintenance mode"
@@ -248,23 +305,11 @@ if [[ ! -s "$DUMP" ]]; then
   fail 10 "DB dump missing or empty: $DUMP"
 fi
 
-# True integrity check (no SIGPIPE problems)
 if ! zstd -t --quiet "$DUMP"; then
   fail 11 "DB dump failed zstd integrity test (corrupt or unreadable): $DUMP"
-  #log "[ERROR] zstd test failed. Dump file details:"
-  #ls -l "$DUMP" || true
-  # show first bytes for "wrong file" class of bugs, but keep it minimal
-  #head -c 64 "$DUMP" | hexdump -C || true
-  #fail 11 "DB dump failed zstd integrity test: $DUMP"
 fi
-log "[INFO] Database dump OK"
 
-# Additional semantic check (optional). Keep disabled unless you want it.
-# PHASE="db_dump_content_check"
-# if ! zstd -dc "$DUMP" | head -n 1 | grep -Eq '^(--|/\*|CREATE|SET)'; then
-#   log "[ERROR] DB dump does not look like SQL: $DUMP"
-#   exit 11
-# fi
+log "[INFO] Database dump OK"
 
 PHASE="done"
 log "[INFO] Post script main flow done; exit handler will finalize based on xferOK and internal status"
