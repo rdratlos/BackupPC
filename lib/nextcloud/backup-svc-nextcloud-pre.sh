@@ -2,7 +2,7 @@
 # =============================================================================
 # Nextcloud Service Backup — Hosted via BackupPC
 #
-# This script is part of the *service backup strategy* integrating
+# Pre hook for BackupPC *service backups* integrating
 # Incus container-based services Nextcloud and MariaDB with BackupPC.
 #
 # Key paths:
@@ -15,8 +15,8 @@
 #     distinct backup source.
 #
 #   • Sudoers (example drop-in under /etc/sudoers.d/backuppc-svc):
-#     backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services/ /srv/backuppc/services/
-#     backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/
+#     backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services /srv/backuppc/services
+#     backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services
 #
 #   • Required directories must exist prior to backup:
 #       sudo mkdir -p /export/mariadb/backuppc/services
@@ -25,7 +25,7 @@
 #       sudo mkdir -p /srv/backuppc/services
 #       sudo chown -R backuppc:backuppc /srv/backuppc
 #
-#   • This script is invoked by BackupPC as a pre/post user command
+#   • This script is invoked by BackupPC as a pre user command
 #     with uid=backuppc.
 #
 # Exit behavior:
@@ -82,29 +82,109 @@ fail() {
   exit "$rc"
 }
 
-### Service bind mount functions ###
-is_mounted() {
-  mountpoint -q -- "$1"
-}
+# BIND MOUNT VERIFICATION AND CREATION
+# ------------------------------------
+# This function ensures DEST is bind-mounted from exactly SOURCE.
+#
+# How it works:
+#   findmnt shows bind mounts to subdirectories as: device[/subpath]
+#   We construct this string from SOURCE and compare against DEST.
+#
+# What it catches:
+#   - DEST mounted from wrong directory
+#   - DEST mounted from wrong filesystem
+#   - DEST is a regular mount, not a bind mount (for subdirectory sources)
+#
+# Exit codes:
+#   0  - Bind mount correctly in place (existing or newly created)
+#   20 - Mount verification failed
 
 ensure_bind_mount() {
-  local src="$1" dst="$2"
+  local src="${1:-}" dst="${2:-}"
 
-  mkdir -p -- "$src" "$dst"
+  # Validate parameters
+  if [[ -z "$src" || -z "$dst" ]]; then
+    log "[ERROR] ensure_bind_mount requires source and destination parameters"
+    exit 20
+  fi
 
-  if is_mounted "$dst"; then
-    # If already mounted, verify it's the mount we expect.
-    local actual_src
-    actual_src="$(findmnt -n -o SOURCE --target "$dst" 2>/dev/null || true)"
-    if [[ "$actual_src" != "$src" ]]; then
-      fail 20 "$dst is already a mountpoint, but source differs (expected=$src actual=$actual_src)"
+  # Create directories if needed
+  if ! mkdir -p -- "$src" "$dst"; then
+    log "[ERROR] Failed to create directories: $src and/or $dst"
+    exit 20
+  fi
+
+  # Resolve symlinks for consistent comparison
+  local src_resolved="" dst_resolved=""
+  src_resolved=$(realpath "$src" 2>/dev/null) || true
+  dst_resolved=$(realpath "$dst" 2>/dev/null) || true
+
+  if [[ -z "$src_resolved" || ! -d "$src_resolved" ]]; then
+    log "[ERROR] Source not accessible: $src"
+    exit 20
+  fi
+
+  if [[ -z "$dst_resolved" || ! -d "$dst_resolved" ]]; then
+    log "[ERROR] Destination not accessible: $dst"
+    exit 20
+  fi
+
+  # Check if DEST is currently mounted
+  local actual=""
+  actual=$(findmnt -n -o SOURCE --mountpoint "$dst_resolved" 2>/dev/null) || true
+
+  if [[ -z "$actual" ]]; then
+    # Not mounted — create the bind mount
+    log "[INFO] Creating bind mount: $src -> $dst"
+    if ! sudo /usr/bin/mount --bind "$src" "$dst"; then
+      log "[ERROR] Failed to create bind mount: $src -> $dst"
+      exit 20
     fi
+    log "[INFO] Bind mount created successfully"
+    return 0
+  fi
+
+  # DEST is mounted — verify it's from exactly SOURCE
+  # Walk up SOURCE to find its actual mount point
+  local path="$src_resolved"
+  local src_device="" src_mountpoint=""
+  while [[ -n "$path" ]]; do
+    src_device=$(findmnt -n -o SOURCE --mountpoint "$path" 2>/dev/null) || true
+    if [[ -n "$src_device" ]]; then
+      src_mountpoint="$path"
+      break
+    fi
+    path="${path%/*}"
+  done
+
+  if [[ -z "$src_device" ]]; then
+    log "[ERROR] Could not determine mount point for source: $src"
+    log "[ERROR] Is the underlying filesystem mounted?"
+    exit 20
+  fi
+
+  # Calculate relative path and build expected SOURCE string
+  local relative="${src_resolved#$src_mountpoint}"
+  local expected=""
+  if [[ -n "$relative" ]]; then
+    expected="${src_device}[${relative}]"
+  else
+    expected="$src_device"
+  fi
+
+  # Compare
+  if [[ "$actual" == "$expected" ]]; then
     log "[INFO] Bind mount already present: $src -> $dst"
     return 0
   fi
 
-  log "[INFO] Creating bind mount: $src -> $dst"
-  sudo /usr/bin/mount --bind "$src" "$dst"
+  # Mismatch — report details and fail
+  log "[ERROR] $dst is already a mountpoint, but not our expected bind mount."
+  log "[ERROR] expected source: $expected"
+  log "[ERROR] actual source:   $actual"
+  log "[ERROR] findmnt output:"
+  log "[ERROR]   $(findmnt -o SOURCE,TARGET,FSTYPE,OPTIONS --target "$dst_resolved" 2>/dev/null || echo 'n/a')"
+  exit 20
 }
 
 ### Enterprise-ish directory cleanup function (wipe contents, keep dir) ###
@@ -125,7 +205,9 @@ safe_wipe_dir_contents() {
 
   # Remove everything under it (including dotfiles via dotglob)
   local olddotglob oldnullglob
-  olddotglob=$(shopt -p dotglob); oldnullglob=$(shopt -p nullglob)
+  # Explicitly allow the non-zero exit, as shopt additionally returns exit status = 1
+  # if option is disabled (on a normal system dotglob is usually disabled)
+  olddotglob=$(shopt -p dotglob || true); oldnullglob=$(shopt -p nullglob || true)
   shopt -s dotglob nullglob
   rm -rf --one-file-system -- "${dir:?}/"*
   eval "$olddotglob"; eval "$oldnullglob"
@@ -221,7 +303,7 @@ date -Is > "${STAGING_DIR}/meta/started_at"
 
 ### 1. Ensure bind mount exists for BackupPC view ###
 PHASE="bind_mount_prepare"
-ensure_bind_mount "$STAGING_DIR" "$VIEW_DIR"
+ensure_bind_mount "$STAGING_ROOT" "$VIEW_ROOT"
 
 ### 2. Enable maintenance mode ###
 PHASE="maintenance_on"
