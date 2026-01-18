@@ -5,6 +5,10 @@
 # Pre hook for BackupPC *service backups* integrating
 # Incus container-based services Nextcloud and MariaDB with BackupPC.
 #
+# This script stages application-consistent service artifacts (DB dump, config
+# snapshot, inventory) into a dedicated staging directory. BackupPC then backs
+# up the bind-mounted *view* directory.
+#
 # Key paths:
 #   • Staging (scratch on fast storage): /export/mariadb/backuppc/services/<svc>
 #   • BackupPC view (bind mount):       /srv/backuppc/services/<svc>
