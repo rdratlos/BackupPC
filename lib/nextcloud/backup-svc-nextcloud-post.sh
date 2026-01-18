@@ -12,6 +12,13 @@
 #   • On success: unmount BackupPC view and remove staging
 #   • On failure or xferOK!=1: keep bind mount + staging as evidence
 #
+# Command contract (BackupPC):
+#   DumpPostUserCmd should invoke this script with:
+#     backup-svc-nextcloud-post.sh <cmdType> <xferOK>
+#   where:
+#     cmdType : BackupPC command type (string)
+#     xferOK  : 1=transfer ok, 0=transfer failed (may be empty in some paths)
+#
 # Key paths:
 #   • Staging (scratch): /export/mariadb/backuppc/services/<svc>
 #   • BackupPC view:    /srv/backuppc/services/<svc>
@@ -52,6 +59,13 @@ set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 umask 077
 
+CMD_TYPE_ARG="${1-}"
+XFER_OK_ARG="${2-}"
+
+# Optional fallback for manual runs:
+CMD_TYPE="${CMD_TYPE_ARG:-${cmdType-}}"
+XFER_OK_RAW="${XFER_OK_ARG:-${xferOK-}}"
+
 ### CONFIG ###
 APP_CT="nextcloud-server"
 SERVICE_NAME="nextcloud"
@@ -63,9 +77,6 @@ VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
 
 LOGFILE="/var/log/backuppc/svc-nextcloud-post.log"
 
-# BackupPC sets xferOK for post commands. If unset, treat as failure.
-XFER_OK="${xferOK:-0}"
-
 ### LOGGING SETUP ###
 mkdir -p -- "$(dirname -- "$LOGFILE")"
 exec >>"$LOGFILE" 2>&1
@@ -76,6 +87,7 @@ PHASE="init"
 FAILED=0
 FAIL_RC=0
 FAIL_MSG=""
+XFER_OK=0
 
 META_DIR="${STAGING_DIR}/meta"
 
@@ -285,10 +297,50 @@ on_exit() {
   exit 0
 }
 
+get_xferOK_status() {
+  # Prefer argv (BackupPC wrapper), fall back to env for manual debugging.
+  local cmd_type="${CMD_TYPE_ARG:-${cmdType-}}"
+  local xfer_raw="${XFER_OK_ARG:-${xferOK-}}"
+
+  # Normalize "unset/empty" to empty string
+  cmd_type="${cmd_type:-}"
+  xfer_raw="${xfer_raw:-}"
+
+  # Normalize xferOK (strip optional surrounding quotes)
+  xfer_raw="${xfer_raw#\"}"; xfer_raw="${xfer_raw%\"}"
+  xfer_raw="${xfer_raw#\'}"; xfer_raw="${xfer_raw%\'}"
+
+  # Normalize cmdType (strip optional surrounding quotes)
+  cmd_type="${cmd_type#\"}"; cmd_type="${cmd_type%\"}"
+  cmd_type="${cmd_type#\'}"; cmd_type="${cmd_type%\'}"
+
+  if [[ -z "$xfer_raw" ]]; then
+    # BackupPC did not provide xferOK (common in some paths); decide policy.
+    if [[ -z "$cmd_type" ]]; then
+      log "[ERROR] xferOK and cmdType not provided by BackupPC (argv/env empty); assuming transfer failure"
+      XFER_OK=0
+    else
+      log "[WARN] xferOK not provided but cmdType='${cmd_type}'; assuming transfer success"
+      XFER_OK=1
+    fi
+    return 0
+  fi
+
+  case "$xfer_raw" in
+    1) XFER_OK=1 ;;
+    0) XFER_OK=0 ;;
+    *)
+      log "[ERROR] xferOK non-standard ('${xfer_raw}'); BackupPC configuration needs to be checked"
+      XFER_OK=0
+      ;;
+  esac
+}
+
 trap on_err ERR
 trap on_exit EXIT
 
 log "==== POST backup start ===="
+get_xferOK_status
 log "[INFO] BackupPC xferOK=${XFER_OK}"
 
 ### MAIN FLOW ###
