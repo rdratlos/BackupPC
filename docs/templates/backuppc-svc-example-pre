@@ -1,0 +1,87 @@
+#!/bin/bash
+# =============================================================================
+# /usr/local/sbin/backuppc-svc-example-pre
+# =============================================================================
+#
+# Example pre-backup script demonstrating common.sh usage.
+# This is a template - adapt for your specific service.
+#
+# Called by BackupPC as DumpPreUserCmd:
+#   $Conf{DumpPreUserCmd} = '/usr/local/sbin/backuppc-svc-example-pre $host';
+#
+# Exit codes:
+#   0  - Success
+#   1  - General error
+#   2  - Configuration/validation error
+#   3  - Staging operation failed
+#   4  - Container operation failed
+#   5  - Timeout
+#   10 - Lock acquisition failed
+#
+# =============================================================================
+
+# Source shared library
+source /usr/local/lib/backuppc/common.sh
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+SERVICE="example"
+CONTAINER="ct-${SERVICE}"
+STAGING_ROOT="/srv/backuppc-staging"
+STAGING_DIR="${STAGING_ROOT}/${SERVICE}"
+
+# Paths to extract from container (relative to /, no leading slash)
+EXTRACT_PATHS=(
+    "etc/${SERVICE}"
+    "var/lib/${SERVICE}/config"
+)
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    timer_start "total"
+
+    # Validate environment
+    require_command incus
+    require_directory "$STAGING_ROOT"
+
+    # Prevent concurrent runs
+    acquire_lock "$SERVICE"
+
+    # Verify container exists and is running
+    if ! container_exists "$CONTAINER"; then
+        fail 4 "Container does not exist: $CONTAINER"
+    fi
+
+    if ! container_running "$CONTAINER"; then
+        warn "Container not running: $CONTAINER - starting it"
+        incus start "$CONTAINER"
+        wait_container_ready "$CONTAINER" 60
+    fi
+
+    # Clean staging area
+    cleanup_staging "$STAGING_DIR"
+
+    # Extract paths from container
+    for path in "${EXTRACT_PATHS[@]}"; do
+        # Determine destination subdirectory (preserve structure)
+        local dest_subdir
+        dest_subdir=$(dirname "$path" | tr '/' '-')
+        [[ "$dest_subdir" == "." ]] && dest_subdir=""
+
+        local dest="${STAGING_DIR}/${dest_subdir}"
+        ensure_staging_dir "$dest"
+
+        timer_start "extract_${path}"
+        extract_container_path "$CONTAINER" "$path" "$dest"
+        timer_log "extract_${path}" "Extracted ${path}"
+    done
+
+    timer_log "total" "Pre-backup for ${SERVICE}"
+    log "Staging directory ready: $STAGING_DIR"
+}
+
+# Run main function
+main "$@"
