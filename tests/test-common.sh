@@ -54,15 +54,34 @@ echo "bytes_to_human 2097152: $(bytes_to_human 2097152)"
 echo "bytes_to_human 3221225472: $(bytes_to_human 3221225472)"
 echo ""
 
-# Test 6: Cleanup registration (without actually failing)
-echo "--- Test 6: Cleanup registration ---"
-register_cleanup "echo 'Cleanup action 1 executed'"
-register_cleanup "echo 'Cleanup action 2 executed'"
-echo "Registered 2 cleanup actions (will execute on exit)"
+# Test 6: Phase tracking
+echo "--- Test 6: Phase tracking ---"
+echo "Initial PHASE: $PHASE"
+PHASE="configuration"
+echo "After setting: $PHASE"
+PHASE="extraction"
+echo "After update: $PHASE"
 echo ""
 
-# Test 7: Lock acquisition (skip if log dir doesn't exist)
-echo "--- Test 7: Lock management ---"
+# Test 7: Failure state (without actually failing)
+echo "--- Test 7: Failure state inspection ---"
+echo "FAILED: $FAILED (should be 0)"
+echo "FAIL_RC: $FAIL_RC (should be 0)"
+echo "FAIL_MSG: '${FAIL_MSG}' (should be empty)"
+echo ""
+echo "get_failure_summary (success case):"
+get_failure_summary
+echo ""
+
+# Test 8: Cleanup registration
+echo "--- Test 8: Cleanup registration ---"
+register_cleanup "echo '  → Cleanup action 1 executed'"
+register_cleanup "echo '  → Cleanup action 2 executed'"
+echo "Registered 2 cleanup actions (will execute on exit via on_exit trap)"
+echo ""
+
+# Test 9: Lock management
+echo "--- Test 9: Lock management ---"
 if [[ -d "$BACKUPPC_LOG_DIR" && -w "$BACKUPPC_LOG_DIR" ]]; then
     acquire_lock "test-lock"
     echo "Lock file created: ${BACKUPPC_LOG_DIR}/LOCK.test-lock"
@@ -73,4 +92,10 @@ else
 fi
 echo ""
 
-echo "=== Test suite complete ==="
+# Test 10: Enable strict traps (for final exit handling)
+echo "--- Test 10: Strict traps ---"
+enable_strict_traps
+echo "Strict traps enabled - on_exit will run at script end"
+echo ""
+
+echo "=== Test suite complete (on_exit trap will now fire) ==="

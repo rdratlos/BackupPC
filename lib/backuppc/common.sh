@@ -101,21 +101,155 @@ error() { _log ERROR "$@"; }
 debug() { [[ "${DEBUG:-0}" == "1" ]] && _log DEBUG "$@" || true; }
 
 # -----------------------------------------------------------------------------
+# Phase tracking and failure state
+# -----------------------------------------------------------------------------
+# Scripts can set PHASE to track where they are in execution.
+# Failure state is captured for use in exit handlers.
+#
+# Usage:
+#   PHASE="extracting config"
+#   extract_container_path ...
+#   PHASE="database dump"
+#   run_dump ...
+
+# Human-readable phase marker for logs
+declare -g PHASE="init"
+
+# Failure state (captured by fail() and on_err trap)
+declare -g FAILED=0
+declare -g FAIL_RC=0
+declare -g FAIL_MSG=""
+declare -g FAIL_PHASE=""
+declare -g FAIL_LINE=""
+declare -g FAIL_CMD=""
+
+# -----------------------------------------------------------------------------
 # Error handling
 # -----------------------------------------------------------------------------
-# fail: Log fatal error and exit with given code
+# fail: Mark failure state and exit
 # Usage: fail <exit_code> <message>
+#
+# Captures current phase and sets global failure state before exiting.
+# The on_exit handler can then perform appropriate cleanup.
 
 fail() {
-    local exit_code="${1:-1}"
+    local rc="${1:-1}"
     shift
-    error "FATAL: $*"
-    exit "$exit_code"
+    local msg="$*"
+
+    # Only capture first failure (subsequent calls during cleanup are logged but don't override)
+    if [[ "$FAILED" -eq 0 ]]; then
+        FAILED=1
+        FAIL_RC="$rc"
+        FAIL_MSG="$msg"
+        FAIL_PHASE="$PHASE"
+        FAIL_LINE="${BASH_LINENO[0]:-unknown}"
+        FAIL_CMD="${BASH_COMMAND:-unknown}"
+    fi
+
+    error "FATAL: phase=${PHASE} rc=${rc} msg=${msg}"
+    exit "$rc"
 }
 
 # die: Shorthand for fail with exit code 1
 die() {
     fail 1 "$@"
+}
+
+# -----------------------------------------------------------------------------
+# Trap handlers
+# -----------------------------------------------------------------------------
+# on_err: ERR trap handler - captures unexpected errors
+# Triggered by set -o errexit when a command fails.
+#
+# Note: To enable, scripts must call: trap 'on_err' ERR
+#       Or use: enable_strict_traps
+
+on_err() {
+    local rc=$?
+
+    # Capture failure details
+    if [[ "$FAILED" -eq 0 ]]; then
+        FAILED=1
+        FAIL_RC="$rc"
+        FAIL_PHASE="$PHASE"
+        FAIL_LINE="${BASH_LINENO[0]:-unknown}"
+        FAIL_CMD="${BASH_COMMAND:-unknown}"
+        FAIL_MSG="command failed: ${FAIL_CMD}"
+        error "Unexpected error: phase=${FAIL_PHASE} rc=${rc} line=${FAIL_LINE} cmd=${FAIL_CMD}"
+    else
+        # Additional error during cleanup/exit - log but don't override original
+        warn "Additional error: phase=${PHASE} rc=${rc} line=${BASH_LINENO[0]:-?} cmd=${BASH_COMMAND:-?}"
+    fi
+
+    return "$rc"
+}
+
+# on_exit: EXIT trap handler - runs cleanup and reports final status
+# This is the main exit handler that:
+#   1. Runs registered cleanup actions
+#   2. Reports success/failure with context
+#   3. Exits with appropriate code
+#
+# Note: Automatically installed by enable_strict_traps or can be
+#       manually set with: trap 'on_exit' EXIT
+
+on_exit() {
+    local rc=$?
+
+    # If we're exiting due to a failure, use the captured code
+    # Otherwise use the actual exit code
+    local final_rc="${FAIL_RC:-$rc}"
+    if [[ "$FAILED" -ne 0 ]]; then
+        final_rc="$FAIL_RC"
+    fi
+
+    # Run registered cleanup actions (in reverse order)
+    _run_cleanup_actions
+
+    # Final status report
+    if [[ "$FAILED" -ne 0 ]]; then
+        error "Script failed: phase=${FAIL_PHASE:-unknown} rc=${FAIL_RC} msg=${FAIL_MSG:-unknown error}"
+        error "==== ${SCRIPT_NAME} FAILED ===="
+        exit "$final_rc"
+    fi
+
+    log "==== ${SCRIPT_NAME} completed successfully ===="
+    exit "$final_rc"
+}
+
+# enable_strict_traps: Install ERR and EXIT traps for comprehensive error handling
+# Call this early in your script after sourcing common.sh
+#
+# Usage:
+#   source /usr/local/lib/backuppc/common.sh
+#   enable_strict_traps
+#
+# This enables:
+#   - ERR trap: Captures unexpected command failures
+#   - EXIT trap: Ensures cleanup runs and reports final status
+
+enable_strict_traps() {
+    trap 'on_err' ERR
+    trap 'on_exit' EXIT
+    debug "Strict traps enabled (ERR + EXIT)"
+}
+
+# get_failure_summary: Return a structured summary of the failure
+# Useful for external reporting or notification scripts
+get_failure_summary() {
+    if [[ "$FAILED" -eq 0 ]]; then
+        echo "status=success"
+    else
+        cat <<EOF
+status=failed
+phase=${FAIL_PHASE:-unknown}
+rc=${FAIL_RC:-1}
+line=${FAIL_LINE:-unknown}
+cmd=${FAIL_CMD:-unknown}
+msg=${FAIL_MSG:-unknown}
+EOF
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -168,36 +302,52 @@ release_lock() {
 }
 
 # -----------------------------------------------------------------------------
-# Cleanup trap management
+# Cleanup action management
 # -----------------------------------------------------------------------------
-# Allows registering multiple cleanup actions that run on EXIT.
+# Register cleanup actions that run on script exit (via on_exit trap).
 # Actions run in reverse order of registration (LIFO).
 #
 # Usage:
 #   register_cleanup "rm -f /tmp/myfile"
 #   register_cleanup "cleanup_function arg1 arg2"
+#
+# Note: Cleanup actions run even on failure. Check $FAILED inside
+#       cleanup functions if you need conditional behavior.
 
 register_cleanup() {
     local action="$1"
     _CLEANUP_ACTIONS+=("$action")
-
-    # Install trap only once
-    if [[ ${#_CLEANUP_ACTIONS[@]} -eq 1 ]]; then
-        trap '_run_cleanup' EXIT
-    fi
+    debug "Registered cleanup action: $action"
 }
 
-_run_cleanup() {
-    local exit_code=$?
+# Internal: Run all registered cleanup actions
+# Called by on_exit trap handler
+_run_cleanup_actions() {
     local i
+    local action
+    local cleanup_errors=0
 
-    # Run in reverse order
+    if [[ ${#_CLEANUP_ACTIONS[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    debug "Running ${#_CLEANUP_ACTIONS[@]} cleanup actions"
+
+    # Run in reverse order (LIFO)
     for ((i=${#_CLEANUP_ACTIONS[@]}-1; i>=0; i--)); do
-        debug "Cleanup: ${_CLEANUP_ACTIONS[i]}"
-        eval "${_CLEANUP_ACTIONS[i]}" 2>/dev/null || true
+        action="${_CLEANUP_ACTIONS[i]}"
+        debug "Cleanup: $action"
+
+        # Run cleanup, capture errors but don't abort
+        if ! eval "$action" 2>/dev/null; then
+            warn "Cleanup action failed: $action"
+            ((cleanup_errors++)) || true
+        fi
     done
 
-    exit "$exit_code"
+    if [[ $cleanup_errors -gt 0 ]]; then
+        warn "Some cleanup actions failed ($cleanup_errors errors)"
+    fi
 }
 
 # -----------------------------------------------------------------------------

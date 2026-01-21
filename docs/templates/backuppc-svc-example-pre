@@ -22,6 +22,7 @@
 
 # Source shared library
 source /usr/local/lib/backuppc/common.sh
+enable_strict_traps
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -38,19 +39,42 @@ EXTRACT_PATHS=(
 )
 
 # -----------------------------------------------------------------------------
+# Service-specific cleanup
+# -----------------------------------------------------------------------------
+# Called automatically on exit (success or failure)
+# Can check $FAILED to determine if rollback is needed
+
+cleanup_service() {
+    if [[ "$FAILED" -ne 0 ]]; then
+        warn "Cleaning up after failure in phase: ${FAIL_PHASE:-unknown}"
+        # Add rollback logic here if needed, e.g.:
+        # - Re-enable services that were stopped
+        # - Remove partial staging data
+        # - Restore container state
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 main() {
     timer_start "total"
+    PHASE="init"
+
+    # Register cleanup early so it runs even on early failures
+    register_cleanup "cleanup_service"
 
     # Validate environment
+    PHASE="validation"
     require_command incus
     require_directory "$STAGING_ROOT"
 
     # Prevent concurrent runs
+    PHASE="locking"
     acquire_lock "$SERVICE"
 
     # Verify container exists and is running
+    PHASE="container_check"
     if ! container_exists "$CONTAINER"; then
         fail 4 "Container does not exist: $CONTAINER"
     fi
@@ -62,9 +86,11 @@ main() {
     fi
 
     # Clean staging area
+    PHASE="staging_cleanup"
     cleanup_staging "$STAGING_DIR"
 
     # Extract paths from container
+    PHASE="extraction"
     for path in "${EXTRACT_PATHS[@]}"; do
         # Determine destination subdirectory (preserve structure)
         local dest_subdir
@@ -79,6 +105,7 @@ main() {
         timer_log "extract_${path}" "Extracted ${path}"
     done
 
+    PHASE="complete"
     timer_log "total" "Pre-backup for ${SERVICE}"
     log "Staging directory ready: $STAGING_DIR"
 }
