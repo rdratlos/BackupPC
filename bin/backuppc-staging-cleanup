@@ -12,7 +12,7 @@
 #   controlled elevation with strict path validation.
 #
 # Security model:
-#   - Allowlist: Only directories under roots defined in staging-roots.conf
+#   - Allowlist: Only directories under roots defined in /etc/backuppc/staging.conf
 #   - Depth check: Target must be at least 2 levels below an allowed root
 #   - Config validation: staging-roots.conf must be root-owned
 #   - Path canonicalization: Prevents symlink traversal attacks
@@ -38,7 +38,7 @@ set -euo pipefail
 
 # Configuration
 # Allow override via environment for testing (but not via sudo by default)
-readonly CONFIG="${BACKUPPC_STAGING_ROOTS_CONF:-/etc/backuppc/staging-roots.conf}"
+readonly CONFIG="${BACKUPPC_STAGING_ROOTS_CONF:-/etc/backuppc/staging.conf}"
 readonly SCRIPT_NAME="${0##*/}"
 readonly MIN_DEPTH=2  # Minimum depth below staging root (e.g., /root/service)
 
