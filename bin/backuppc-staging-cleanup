@@ -1,0 +1,231 @@
+#!/bin/bash -f
+# =============================================================================
+# /usr/local/sbin/backuppc-staging-cleanup
+# =============================================================================
+#
+# Privileged helper to safely clean BackupPC staging directories.
+# Designed to be called via sudo by the backuppc user.
+#
+# Purpose:
+#   Staging directories contain files with container-shifted UIDs (100000+)
+#   that the unprivileged backuppc user cannot remove. This helper provides
+#   controlled elevation with strict path validation.
+#
+# Security model:
+#   - Allowlist: Only directories under roots defined in staging-roots.conf
+#   - Depth check: Target must be at least 2 levels below an allowed root
+#   - Config validation: staging-roots.conf must be root-owned
+#   - Path canonicalization: Prevents symlink traversal attacks
+#   - Single purpose: No flags, only one argument (the directory)
+#
+# Usage:
+#   sudo /usr/local/sbin/backuppc-staging-cleanup /srv/backuppc-staging/nextcloud
+#
+# Exit codes:
+#   0 - Success (directory contents removed)
+#   1 - Usage error (wrong arguments)
+#   2 - Configuration error (missing or insecure config)
+#   3 - Path validation failed (not under allowed root or too shallow)
+#   4 - Target does not exist or is not a directory
+#   5 - Cleanup operation failed
+#
+# Sudoers entry:
+#   backuppc ALL=(root) NOPASSWD: /usr/local/sbin/backuppc-staging-cleanup
+#
+# =============================================================================
+
+set -euo pipefail
+
+# Configuration
+# Allow override via environment for testing (but not via sudo by default)
+readonly CONFIG="${BACKUPPC_STAGING_ROOTS_CONF:-/etc/backuppc/staging-roots.conf}"
+readonly SCRIPT_NAME="${0##*/}"
+readonly MIN_DEPTH=2  # Minimum depth below staging root (e.g., /root/service)
+
+# -----------------------------------------------------------------------------
+# Logging (minimal, suitable for sudo context)
+# -----------------------------------------------------------------------------
+log()  { echo "[${SCRIPT_NAME}] $*"; }
+err()  { echo "[${SCRIPT_NAME}] ERROR: $*" >&2; }
+die()  { err "$2"; exit "$1"; }
+
+# -----------------------------------------------------------------------------
+# Validate configuration file security
+# -----------------------------------------------------------------------------
+validate_config() {
+    if [[ ! -f "$CONFIG" ]]; then
+        die 2 "Configuration file not found: $CONFIG"
+    fi
+
+    # Must be owned by root:root
+    local owner group
+    owner=$(stat -c '%U' "$CONFIG")
+    group=$(stat -c '%G' "$CONFIG")
+
+    if [[ "$owner" != "root" || "$group" != "root" ]]; then
+        die 2 "Configuration file must be owned by root:root (found ${owner}:${group}): $CONFIG"
+    fi
+
+    # Must not be world-writable
+    local perms
+    perms=$(stat -c '%a' "$CONFIG")
+    if [[ "${perms: -1}" =~ [2367] ]]; then
+        die 2 "Configuration file must not be world-writable (found mode $perms): $CONFIG"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Load allowed roots from configuration
+# -----------------------------------------------------------------------------
+load_allowed_roots() {
+    local -n roots_ref=$1
+    local line
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        # Trim whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        # Skip if empty after trimming
+        [[ -z "$line" ]] && continue
+
+        # Validate path is absolute
+        if [[ "$line" != /* ]]; then
+            err "Ignoring non-absolute path in config: $line"
+            continue
+        fi
+
+        roots_ref+=("$line")
+    done < "$CONFIG"
+
+    if [[ ${#roots_ref[@]} -eq 0 ]]; then
+        die 2 "No valid staging roots defined in: $CONFIG"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Check if target is under an allowed root and deep enough
+# -----------------------------------------------------------------------------
+validate_path() {
+    local target="$1"
+    shift
+    local -a allowed_roots=("$@")
+
+    local matched_root=""
+    local root
+
+    for root in "${allowed_roots[@]}"; do
+        # Canonicalize the allowed root (may not exist, so use -m)
+        local canonical_root
+        canonical_root=$(realpath -m "$root" 2>/dev/null) || continue
+
+        # Check if target starts with this root followed by /
+        if [[ "$target" == "$canonical_root"/* ]]; then
+            matched_root="$canonical_root"
+            break
+        fi
+    done
+
+    if [[ -z "$matched_root" ]]; then
+        die 3 "Path not under any allowed staging root: $target"
+    fi
+
+    # Calculate depth relative to matched root
+    local relative_path="${target#"$matched_root/"}"
+    local depth
+    depth=$(echo "$relative_path" | tr -cd '/' | wc -c)
+    # Add 1 because a path like "nextcloud" has 0 slashes but depth 1
+    depth=$((depth + 1))
+
+    if [[ $depth -lt $MIN_DEPTH ]]; then
+        die 3 "Path too shallow (depth $depth, minimum $MIN_DEPTH): $target"
+    fi
+
+    log "Validated: $target (under $matched_root, depth $depth)"
+}
+
+# -----------------------------------------------------------------------------
+# Perform the cleanup
+# -----------------------------------------------------------------------------
+do_cleanup() {
+    local target="$1"
+
+    # Verify target exists and is a directory
+    if [[ ! -e "$target" ]]; then
+        # Not an error - target may not exist yet, that's fine
+        log "Target does not exist (nothing to clean): $target"
+        return 0
+    fi
+
+    if [[ ! -d "$target" ]]; then
+        die 4 "Target is not a directory: $target"
+    fi
+
+    log "Cleaning contents of: $target"
+
+    # Delete all contents (but not the directory itself)
+    # -xdev: Stay on same filesystem (safety against mount points)
+    # -mindepth 1: Don't delete the target directory itself
+    if ! find "$target" -xdev -mindepth 1 -delete 2>&1; then
+        die 5 "Failed to clean directory contents: $target"
+    fi
+
+    log "Cleanup complete: $target"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    # Argument validation
+    if [[ $# -ne 1 ]]; then
+        echo "Usage: $SCRIPT_NAME <staging-directory>" >&2
+        echo "" >&2
+        echo "Safely removes contents of a BackupPC staging directory." >&2
+        echo "Target must be under a root defined in: $CONFIG" >&2
+        exit 1
+    fi
+
+    local target="$1"
+
+    # Basic sanity checks before any filesystem operations
+    if [[ -z "$target" || "$target" == "/" || "$target" == "." || "$target" == ".." ]]; then
+        die 3 "Refusing dangerous target: '$target'"
+    fi
+
+    # Explicit block of obviously dangerous paths
+    case "$target" in
+        /|/bin|/boot|/dev|/etc|/home|/lib*|/opt|/proc|/root|/run|/sbin|/sys|/tmp|/usr|/var)
+            die 3 "Refusing to clean system directory: $target"
+            ;;
+    esac
+
+    # Canonicalize the target path
+    # Use -e to ensure target exists (for the realpath), but we'll handle
+    # non-existence gracefully in do_cleanup
+    local real_target
+    if [[ -e "$target" ]]; then
+        real_target=$(realpath -e "$target") || die 4 "Failed to resolve path: $target"
+    else
+        # Target doesn't exist - use -m to get canonical form anyway
+        real_target=$(realpath -m "$target") || die 4 "Failed to resolve path: $target"
+    fi
+
+    # Validate config file security
+    validate_config
+
+    # Load allowed roots
+    local -a allowed_roots=()
+    load_allowed_roots allowed_roots
+
+    # Validate path against allowlist
+    validate_path "$real_target" "${allowed_roots[@]}"
+
+    # Perform cleanup
+    do_cleanup "$real_target"
+}
+
+main "$@"
