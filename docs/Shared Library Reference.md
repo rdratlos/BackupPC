@@ -186,7 +186,7 @@ log "Staging ready: $STAGING"
 | `/usr/local/sbin/backuppc-staging-cleanup` | Privileged staging cleanup helper |
 | `/usr/local/sbin/tarCreate`                | Privileged tar create wrapper     |
 | `/usr/local/sbin/tarRestore`               | Privileged tar restore wrapper    |
-| `/etc/backuppc/staging-roots.conf`         | Allowed staging directories       |
+| `/etc/backuppc/staging.conf`         | Allowed staging directories       |
 
 ---
 

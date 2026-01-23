@@ -32,7 +32,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 CLEANUP_SCRIPT="$PROJECT_ROOT/bin/backuppc-staging-cleanup"
 TEST_BASE="/tmp/backuppc-staging-cleanup-test-$$"
-TEST_CONFIG="$TEST_BASE/staging-roots.conf"
+TEST_CONFIG="$TEST_BASE/staging.conf"
 TEST_STAGING="$TEST_BASE/staging"
 
 # -----------------------------------------------------------------------------
