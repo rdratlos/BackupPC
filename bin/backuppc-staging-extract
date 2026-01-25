@@ -1,0 +1,387 @@
+#!/bin/bash
+# =============================================================================
+# /usr/local/sbin/backuppc-staging-extract
+# =============================================================================
+#
+# Helper to extract files from Incus containers to staging directories,
+# preserving ownership and permissions through tar stream.
+#
+# This script runs as user backuppc and uses sudo internally to call
+# tarRestore for privilege elevation. The backuppc user must have sudoers
+# permission for /usr/local/sbin/tarRestore (standard BackupPC setup).
+#
+# Usage:
+#   backuppc-staging-extract <container> <staging_dir> <path> [path...]
+#   backuppc-staging-extract <container> <staging_dir> --file-list <listfile>
+#
+# Arguments:
+#   container    - Name of Incus container
+#   staging_dir  - Destination staging directory (must be under allowed root)
+#   path         - Path(s) relative to container root (e.g., "etc" or "etc/nginx")
+#   --file-list  - Read paths from file (one per line)
+#
+# Environment:
+#   STAGING_CONFIG  - Override config file path (for testing)
+#   TARRESTORE_CMD  - Override tarRestore path (for testing)
+#   INCUS_CMD       - Override incus command path (for testing)
+#
+# Exit codes:
+#   0  - Success
+#   1  - Invalid arguments
+#   2  - Configuration error
+#   3  - Security validation failed
+#   4  - Container error (not found, not running)
+#   5  - Extraction failed
+#
+# Security:
+#   - Validates staging_dir is under allowed root in staging.conf
+#   - Config file must be owned by root:root, mode 644 or stricter
+#   - Uses sudo tarRestore for controlled privilege elevation
+#   - Rejects paths with .. components
+#
+# =============================================================================
+
+export LC_ALL=C
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+readonly DEFAULT_CONFIG="/etc/backuppc/staging.conf"
+readonly DEFAULT_TARRESTORE="/usr/local/sbin/tarRestore"
+readonly DEFAULT_INCUS="/usr/bin/incus"
+
+# Allow overrides for testing
+CONFIG_FILE="${STAGING_CONFIG:-$DEFAULT_CONFIG}"
+TARRESTORE="${TARRESTORE_CMD:-$DEFAULT_TARRESTORE}"
+INCUS="${INCUS_CMD:-$DEFAULT_INCUS}"
+
+# Tar options for complete metadata preservation
+# --format=posix   : POSIX.1-2001 (pax) format for extended attributes
+# --numeric-owner  : Store UIDs/GIDs numerically (critical for shifted UIDs)
+# --preserve-permissions : Preserve file permissions
+readonly TAR_CREATE_OPTS="--format=posix --numeric-owner --preserve-permissions"
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+readonly SCRIPT_NAME="$(basename "$0")"
+
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SCRIPT_NAME}: $*" >&2
+}
+
+log() { _log "INFO: $*"; }
+error() { _log "ERROR: $*"; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && _log "DEBUG: $*"; }
+
+# -----------------------------------------------------------------------------
+# Validation functions
+# -----------------------------------------------------------------------------
+
+# Validate config file security
+validate_config_file() {
+    local config="$1"
+
+    if [[ ! -f "$config" ]]; then
+        error "Config file not found: $config"
+        return 2
+    fi
+
+    # Check ownership (must be root:root)
+    local owner group
+    owner=$(stat -c '%u' "$config")
+    group=$(stat -c '%g' "$config")
+    if [[ "$owner" != "0" || "$group" != "0" ]]; then
+        error "Config file must be owned by root:root: $config"
+        return 2
+    fi
+
+    # Check permissions (must not be writable by group/other)
+    local perms
+    perms=$(stat -c '%a' "$config")
+    if [[ "${perms:1:1}" =~ [2367] || "${perms:2:1}" =~ [2367] ]]; then
+        error "Config file must not be writable by group/other: $config (mode $perms)"
+        return 2
+    fi
+
+    return 0
+}
+
+# Load allowed roots from config file
+load_allowed_roots() {
+    local config="$1"
+    local -n roots_ref="$2"
+    roots_ref=()
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Strip whitespace
+        line="${line//[[:space:]]/}"
+        [[ -n "$line" ]] && roots_ref+=("$line")
+    done < "$config"
+
+    if [[ ${#roots_ref[@]} -eq 0 ]]; then
+        error "No allowed roots defined in: $config"
+        return 2
+    fi
+
+    return 0
+}
+
+# Validate path is under an allowed root
+validate_staging_path() {
+    local path="$1"
+    shift
+    local -a allowed_roots=("$@")
+
+    # Canonicalize path (resolve symlinks, remove . and ..)
+    local resolved
+    if ! resolved=$(realpath -m "$path" 2>/dev/null); then
+        error "Cannot resolve path: $path"
+        return 3
+    fi
+
+    # Check against allowed roots
+    for root in "${allowed_roots[@]}"; do
+        local resolved_root
+        if ! resolved_root=$(realpath -m "$root" 2>/dev/null); then
+            continue
+        fi
+
+        # Path must be under root (not equal to root itself)
+        if [[ "$resolved" == "$resolved_root"/* ]]; then
+            return 0
+        fi
+    done
+
+    error "Path not under any allowed root: $path"
+    return 3
+}
+
+# Validate container path (no .. traversal)
+validate_container_path() {
+    local path="$1"
+
+    # Reject paths with .. components
+    if [[ "$path" =~ (^|/)\.\.(/|$) ]]; then
+        error "Path traversal not allowed: $path"
+        return 3
+    fi
+
+    # Reject absolute paths (they should be relative to container root)
+    if [[ "$path" == /* ]]; then
+        error "Container paths must be relative (no leading /): $path"
+        return 3
+    fi
+
+    # Reject empty paths
+    if [[ -z "$path" ]]; then
+        error "Empty path not allowed"
+        return 3
+    fi
+
+    return 0
+}
+
+# Validate container exists and is running
+validate_container() {
+    local container="$1"
+
+    # Check incus command exists
+    if [[ ! -x "$INCUS" ]]; then
+        error "Incus command not found: $INCUS"
+        return 4
+    fi
+
+    # Check container exists
+    if ! "$INCUS" info "$container" &>/dev/null; then
+        error "Container does not exist: $container"
+        return 4
+    fi
+
+    # Check container is running
+    local status
+    status=$("$INCUS" info "$container" 2>/dev/null | grep -E '^Status:' | awk '{print $2}')
+    if [[ "$status" != "RUNNING" ]]; then
+        error "Container is not running: $container (status: ${status:-unknown})"
+        return 4
+    fi
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Extraction functions
+# -----------------------------------------------------------------------------
+
+# Extract a single path from container to staging
+extract_path() {
+    local container="$1"
+    local staging_dir="$2"
+    local src_path="$3"
+
+    log "Extracting: ${container}:/${src_path} → ${staging_dir}"
+
+    # Check if path exists in container
+    if ! "$INCUS" exec "$container" -- test -e "/$src_path" 2>/dev/null; then
+        error "Path does not exist in container: /${src_path}"
+        return 5
+    fi
+
+    # Stream tar from container, restore via sudo tarRestore
+    # Container tar runs as root inside container (in container namespace)
+    # tarRestore runs as root on host via sudo, preserving shifted UIDs
+    if ! "$INCUS" exec "$container" -- tar $TAR_CREATE_OPTS -cf - -C / "$src_path" 2>/dev/null \
+        | sudo "$TARRESTORE" -C "$staging_dir"; then
+        error "Failed to extract: ${container}:/${src_path}"
+        return 5
+    fi
+
+    debug "Extraction complete: ${src_path}"
+    return 0
+}
+
+# Load paths from file
+load_paths_from_file() {
+    local listfile="$1"
+    local -n paths_ref="$2"
+    paths_ref=()
+
+    if [[ ! -f "$listfile" ]]; then
+        error "File list not found: $listfile"
+        return 1
+    fi
+
+    if [[ ! -r "$listfile" ]]; then
+        error "File list not readable: $listfile"
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        # Strip leading/trailing whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -n "$line" ]] && paths_ref+=("$line")
+    done < "$listfile"
+
+    if [[ ${#paths_ref[@]} -eq 0 ]]; then
+        error "No paths defined in: $listfile"
+        return 1
+    fi
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Usage and help
+# -----------------------------------------------------------------------------
+usage() {
+    cat >&2 << 'EOF'
+Usage: backuppc-staging-extract <container> <staging_dir> <path> [path...]
+       backuppc-staging-extract <container> <staging_dir> --file-list <listfile>
+
+Extract files from Incus container to staging directory preserving ownership.
+
+Arguments:
+  container    - Name of Incus container
+  staging_dir  - Destination staging directory
+  path         - Path(s) relative to container root (e.g., "etc" or "etc/nginx")
+  --file-list  - Read paths from file (one per line, # comments supported)
+
+Examples:
+  # Extract single directory
+  backuppc-staging-extract ct-nextcloud /srv/backuppc-staging/nextcloud etc
+
+  # Extract multiple paths
+  backuppc-staging-extract ct-mariadb /srv/backuppc-staging/mariadb etc/my.cnf.d var/lib/mysql
+
+  # Extract from file list
+  backuppc-staging-extract ct-nginx /srv/backuppc-staging/nginx --file-list /etc/backuppc/nginx-paths.txt
+
+Note: Staging directory must be under a root defined in /etc/backuppc/staging.conf
+EOF
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    # Need at least 3 arguments
+    if [[ $# -lt 3 ]]; then
+        usage
+    fi
+
+    local container="$1"
+    local staging_dir="$2"
+    shift 2
+
+    # Validate config file
+    if ! validate_config_file "$CONFIG_FILE"; then
+        exit 2
+    fi
+
+    # Load allowed roots
+    local -a allowed_roots
+    if ! load_allowed_roots "$CONFIG_FILE" allowed_roots; then
+        exit 2
+    fi
+
+    # Validate staging directory is under allowed root
+    if ! validate_staging_path "$staging_dir" "${allowed_roots[@]}"; then
+        exit 3
+    fi
+
+    # Ensure staging directory exists
+    if [[ ! -d "$staging_dir" ]]; then
+        error "Staging directory does not exist: $staging_dir"
+        exit 3
+    fi
+
+    # Validate container
+    if ! validate_container "$container"; then
+        exit 4
+    fi
+
+    # Collect paths to extract
+    local -a paths
+    if [[ "$1" == "--file-list" ]]; then
+        if [[ $# -lt 2 ]]; then
+            error "--file-list requires a filename argument"
+            usage
+        fi
+        if ! load_paths_from_file "$2" paths; then
+            exit 1
+        fi
+    else
+        paths=("$@")
+    fi
+
+    # Validate all container paths before extracting
+    for path in "${paths[@]}"; do
+        if ! validate_container_path "$path"; then
+            exit 3
+        fi
+    done
+
+    # Extract each path
+    local failed=0
+    for path in "${paths[@]}"; do
+        if ! extract_path "$container" "$staging_dir" "$path"; then
+            ((failed++))
+        fi
+    done
+
+    if [[ $failed -gt 0 ]]; then
+        error "Failed to extract $failed path(s)"
+        exit 5
+    fi
+
+    log "Extraction complete: ${#paths[@]} path(s) to $staging_dir"
+    exit 0
+}
+
+main "$@"
