@@ -765,8 +765,10 @@ test_integration_nonexistent_path() {
 
     if [[ $rc -ne 0 ]]; then
         pass "Non-existent path correctly failed (rc=$rc)"
+        echo -e "  INFO: Non-existent path handling: rc=$rc, msg=\n${output}"
     else
         fail "Non-existent path should have failed but succeeded"
+        echo "  INFO: Extract script returned rc=$rc, msg=${output}"
     fi
 }
 
