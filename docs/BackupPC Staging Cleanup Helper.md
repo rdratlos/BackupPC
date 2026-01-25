@@ -7,7 +7,7 @@ The `backuppc-staging-cleanup` helper provides controlled elevation for removing
 | File                     | Path                                     | Purpose                    |
 |--------------------------|------------------------------------------|----------------------------|
 | `backuppc-staging-cleanup` | `/usr/local/sbin/backuppc-staging-cleanup` | Privileged cleanup helper  |
-| `staging-roots.conf`       | `/etc/backuppc/staging-roots.conf`         | Allowlist of staging roots |
+| `staging.conf`       | `/etc/backuppc/staging-roots.conf`         | Allowlist of staging roots |
 
 # Installation
 
@@ -16,10 +16,10 @@ The `backuppc-staging-cleanup` helper provides controlled elevation for removing
 sudo install -m 755 -o root -g root backuppc-staging-cleanup /usr/local/sbin/
 
 # Install and configure the allowlist
-sudo install -m 644 -o root -g root staging-roots.conf /etc/backuppc/
+sudo install -m 644 -o root -g root staging.conf /etc/backuppc/
 
 # Edit to add your staging roots
-sudo vim /etc/backuppc/staging-roots.conf
+sudo vim /etc/backuppc/staging.conf
 
 # Add sudoers entry
 echo 'backuppc ALL=(root) NOPASSWD: /usr/local/sbin/backuppc-staging-cleanup' | \
@@ -29,9 +29,9 @@ sudo chmod 440 /etc/sudoers.d/backuppc-staging-cleanup
 
 # Security Model
 
-1. **Allowlist-based**: Only paths under roots defined in `staging-roots.conf` are accepted
+1. **Allowlist-based**: Only paths under roots defined in `staging.conf` are accepted
 2. **Depth validation**: Target must be at least 2 levels below an allowed root (prevents cleaning the root itself or service directories)
-3. **Config file security**: `staging-roots.conf` must be owned by `root:root` and not world-writable
+3. **Config file security**: `staging.conf` must be owned by `root:root` and not world-writable
 4. **Path canonicalization**: Uses `realpath` to prevent symlink traversal attacks
 5. **System path blocklist**: Explicitly rejects `/`, `/etc`, `/var`, `/home`, etc.
 6. **Single purpose**: No flags, no options, just one directory argument
@@ -77,7 +77,7 @@ cleanup_staging() {
 
 # Configuration Format
 
-`/etc/backuppc/staging-roots.conf`:
+`/etc/backuppc/staging.conf`:
 
 ```conf
 # BackupPC staging roots - one per line

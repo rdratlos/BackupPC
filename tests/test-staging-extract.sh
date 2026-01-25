@@ -137,7 +137,7 @@ run_extract() {
     local -n _output_ref=$1
     local -n _rc_ref=$2
     shift 2
-    
+
     _output_ref=$(STAGING_CONFIG="$TEST_CONFIG" \
                   TARRESTORE_CMD="$MOCK_TARRESTORE" \
                   INCUS_CMD="$MOCK_INCUS" \
@@ -152,7 +152,7 @@ run_extract_custom_config() {
     local -n _output_ref=$2
     local -n _rc_ref=$3
     shift 3
-    
+
     _output_ref=$(STAGING_CONFIG="$config" \
                   TARRESTORE_CMD="$MOCK_TARRESTORE" \
                   INCUS_CMD="$MOCK_INCUS" \
@@ -166,7 +166,7 @@ run_extract_real() {
     local -n _output_ref=$1
     local -n _rc_ref=$2
     shift 2
-    
+
     _output_ref=$(STAGING_CONFIG="$TEST_CONFIG" "$EXTRACT_SCRIPT" "$@" 2>&1)
     _rc_ref=$?
 }
@@ -176,7 +176,7 @@ setup() {
     rm -rf "$TEST_BASE"
     mkdir -p "$TEST_STAGING/service1/data"
     mkdir -p "$TEST_STAGING/service2"
-    
+
     # Create valid config file (root-owned, mode 644)
     # Note: unquoted EOF allows variable expansion
     cat > "$TEST_CONFIG" << EOF
@@ -184,7 +184,7 @@ setup() {
 ${TEST_STAGING}
 EOF
     chmod 644 "$TEST_CONFIG"
-    
+
     # -------------------------------------------------------------------------
     # Mock incus for unit tests
     # -------------------------------------------------------------------------
@@ -224,7 +224,7 @@ case "$1" in
 esac
 EOF
     chmod 755 "$MOCK_INCUS"
-    
+
     # -------------------------------------------------------------------------
     # Mock tarRestore for unit tests
     # -------------------------------------------------------------------------
@@ -234,7 +234,7 @@ EOF
 exec /bin/tar -x -f - "$@"
 EOF
     chmod 755 "$MOCK_TARRESTORE"
-    
+
     # Create test file list
     # Use paths guaranteed to exist in any Linux container
     cat > "$TEST_FILELIST" << 'EOF'
@@ -256,10 +256,10 @@ cleanup() {
 test_no_arguments() {
     log_test "No arguments should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc
-    
+
     if [[ $rc -eq 1 ]]; then
         pass "No arguments (exit 1)"
     else
@@ -270,10 +270,10 @@ test_no_arguments() {
 test_missing_paths() {
     log_test "Missing paths argument should fail"
     ((TESTS_RUN++))
-   
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1"
-    
+
     if [[ $rc -eq 1 ]]; then
         pass "Missing paths (exit 1)"
     else
@@ -284,10 +284,10 @@ test_missing_paths() {
 test_file_list_missing_file() {
     log_test "--file-list without filename should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1" "--file-list"
-    
+
     if [[ $rc -eq 1 ]]; then
         pass "--file-list without filename (exit 1)"
     else
@@ -302,10 +302,10 @@ test_file_list_missing_file() {
 test_missing_config() {
     log_test "Missing config file should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract_custom_config "/nonexistent/config.conf" output rc "mockcontainer" "$TEST_STAGING/service1" "etc"
-    
+
     if [[ $rc -eq 2 ]] || echo "$output" | grep -q "Config file not found"; then
         pass "Missing config file (exit 2)"
     else
@@ -316,15 +316,15 @@ test_missing_config() {
 test_config_bad_owner() {
     log_test "Config with wrong owner should fail"
     ((TESTS_RUN++))
-    
+
     # Create config owned by non-root
     local bad_config="${TEST_BASE}/bad-owner.conf"
     echo "/tmp" > "$bad_config"
     chown 1000:1000 "$bad_config"
-    
+
     local output rc
     run_extract_custom_config "$bad_config" output rc "mockcontainer" "$TEST_STAGING/service1" "etc"
-    
+
     if [[ $rc -eq 2 ]] || echo "$output" | grep -q "must be owned by root"; then
         pass "Config bad owner rejected"
     else
@@ -335,14 +335,14 @@ test_config_bad_owner() {
 test_config_world_writable() {
     log_test "World-writable config should fail"
     ((TESTS_RUN++))
-    
+
     local bad_config="${TEST_BASE}/bad-perms.conf"
     echo "/tmp" > "$bad_config"
     chmod 666 "$bad_config"
-    
+
     local output rc
     run_extract_custom_config "$bad_config" output rc "mockcontainer" "$TEST_STAGING/service1" "etc"
-    
+
     if [[ $rc -eq 2 ]] || echo "$output" | grep -q "must not be writable"; then
         pass "World-writable config rejected"
     else
@@ -353,14 +353,14 @@ test_config_world_writable() {
 test_empty_config() {
     log_test "Empty config (no roots) should fail"
     ((TESTS_RUN++))
-    
+
     local empty_config="${TEST_BASE}/empty.conf"
     echo "# Only comments" > "$empty_config"
     chmod 644 "$empty_config"
-    
+
     local output rc
     run_extract_custom_config "$empty_config" output rc "mockcontainer" "$TEST_STAGING/service1" "etc"
-    
+
     if [[ $rc -eq 2 ]] || echo "$output" | grep -q "No allowed roots"; then
         pass "Empty config rejected"
     else
@@ -375,10 +375,10 @@ test_empty_config() {
 test_staging_not_under_root() {
     log_test "Staging outside allowed roots should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "/tmp/unauthorized" "etc"
-    
+
     if [[ $rc -eq 3 ]] || echo "$output" | grep -q "not under any allowed root"; then
         pass "Unauthorized staging path rejected (exit 3)"
     else
@@ -389,11 +389,11 @@ test_staging_not_under_root() {
 test_staging_is_root() {
     log_test "Staging equal to allowed root should fail"
     ((TESTS_RUN++))
-   
+
     # Try to use the root itself (not something under it)
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING" "etc"
-    
+
     if [[ $rc -eq 3 ]] || echo "$output" | grep -q "not under any allowed root"; then
         pass "Staging = root rejected (exit 3)"
     else
@@ -404,10 +404,10 @@ test_staging_is_root() {
 test_container_path_traversal() {
     log_test "Path traversal in container path should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1" "../../../etc/passwd"
-    
+
     if [[ $rc -eq 3 ]] || echo "$output" | grep -q "traversal"; then
         pass "Path traversal rejected (exit 3)"
     else
@@ -418,10 +418,10 @@ test_container_path_traversal() {
 test_container_path_absolute() {
     log_test "Absolute container path should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1" "/etc"
-    
+
     if [[ $rc -eq 3 ]] || echo "$output" | grep -q "must be relative"; then
         pass "Absolute path rejected (exit 3)"
     else
@@ -432,10 +432,10 @@ test_container_path_absolute() {
 test_container_path_empty() {
     log_test "Empty container path should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1" ""
-    
+
     if [[ $rc -eq 3 ]] || echo "$output" | grep -q "Empty path"; then
         pass "Empty path rejected (exit 3)"
     else
@@ -446,10 +446,10 @@ test_container_path_empty() {
 test_staging_dir_not_exist() {
     log_test "Non-existent staging directory should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/nonexistent" "etc"
-    
+
     if [[ $rc -eq 3 ]] || echo "$output" | grep -q "does not exist"; then
         pass "Non-existent staging rejected (exit 3)"
     else
@@ -464,11 +464,11 @@ test_staging_dir_not_exist() {
 test_container_not_found() {
     log_test "Non-existent container should fail"
     ((TESTS_RUN++))
-    
+
     # Use mock incus - "nonexistent-container" is not "mockcontainer" so it fails
     local output rc
     run_extract output rc "nonexistent-container" "$TEST_STAGING/service1" "etc"
-    
+
     if [[ $rc -eq 4 ]] || echo "$output" | grep -q "does not exist"; then
         pass "Non-existent container rejected (exit 4)"
     else
@@ -483,10 +483,10 @@ test_container_not_found() {
 test_file_list_not_found() {
     log_test "Non-existent file list should fail"
     ((TESTS_RUN++))
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1" "--file-list" "/nonexistent/file.txt"
-    
+
     if [[ $rc -eq 1 ]] || echo "$output" | grep -q "not found"; then
         pass "Non-existent file list rejected"
     else
@@ -497,13 +497,13 @@ test_file_list_not_found() {
 test_file_list_empty() {
     log_test "Empty file list should fail"
     ((TESTS_RUN++))
-    
+
     local empty_list="${TEST_BASE}/empty-list.txt"
     echo "# Only comments" > "$empty_list"
-    
+
     local output rc
     run_extract output rc "mockcontainer" "$TEST_STAGING/service1" "--file-list" "$empty_list"
-    
+
     if [[ $rc -eq 1 ]] || echo "$output" | grep -q "No paths defined"; then
         pass "Empty file list rejected"
     else
@@ -545,13 +545,13 @@ container_file_exists() {
 validate_container_prerequisites() {
     local container="$1"
     local -a missing=()
-    
+
     for path in "${REQUIRED_CONTAINER_FILES[@]}"; do
         if ! container_file_exists "$container" "/$path"; then
             missing+=("/$path")
         fi
     done
-    
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo ""
         echo -e "${RED}ERROR: Test container '$container' is missing required files:${NC}"
@@ -573,15 +573,15 @@ CONTAINER_VALIDATED=0
 # Validate container once before running integration tests
 validate_container_once() {
     local container="${TEST_CONTAINER:-}"
-    
+
     if [[ -z "$container" ]]; then
         return 1
     fi
-    
+
     if [[ $CONTAINER_VALIDATED -eq 1 ]]; then
         return 0
     fi
-    
+
     if validate_container_prerequisites "$container"; then
         CONTAINER_VALIDATED=1
         return 0
@@ -593,31 +593,31 @@ validate_container_once() {
 test_integration_single_path() {
     log_test "Integration: Extract single path from container"
     ((TESTS_RUN++))
-    
+
     local container="${TEST_CONTAINER:-}"
     if [[ -z "$container" ]]; then
         skip "No TEST_CONTAINER specified"
         return
     fi
-    
+
     if [[ -n "${SKIP_CONTAINER:-}" ]]; then
         skip "Container tests disabled (SKIP_CONTAINER set)"
         return
     fi
-    
+
     if ! validate_container_once; then
         skip "Container prerequisites not met"
         return
     fi
-    
+
     # Setup clean staging
     local int_staging="${TEST_STAGING}/integration"
     mkdir -p "$int_staging"
-    
+
     # Run extraction with real incus
     local output rc
     run_extract_real output rc "$container" "$int_staging" "etc/hostname"
-    
+
     if [[ $rc -eq 0 ]] && [[ -f "$int_staging/etc/hostname" ]]; then
         pass "Single path extraction succeeded"
     else
@@ -628,31 +628,31 @@ test_integration_single_path() {
 test_integration_multiple_paths() {
     log_test "Integration: Extract multiple paths from container"
     ((TESTS_RUN++))
-    
+
     local container="${TEST_CONTAINER:-}"
     if [[ -z "$container" ]]; then
         skip "No TEST_CONTAINER specified"
         return
     fi
-    
+
     if [[ -n "${SKIP_CONTAINER:-}" ]]; then
         skip "Container tests disabled (SKIP_CONTAINER set)"
         return
     fi
-    
+
     if ! validate_container_once; then
         skip "Container prerequisites not met"
         return
     fi
-    
+
     # Setup clean staging
     local int_staging="${TEST_STAGING}/integration-multi"
     mkdir -p "$int_staging"
-    
+
     # Run extraction with real incus
     local output rc
     run_extract_real output rc "$container" "$int_staging" "etc/hostname" "etc/passwd"
-    
+
     if [[ $rc -eq 0 ]] && [[ -f "$int_staging/etc/hostname" ]] && [[ -f "$int_staging/etc/passwd" ]]; then
         pass "Multiple paths extraction succeeded"
     else
@@ -663,31 +663,31 @@ test_integration_multiple_paths() {
 test_integration_file_list() {
     log_test "Integration: Extract paths from file list"
     ((TESTS_RUN++))
-    
+
     local container="${TEST_CONTAINER:-}"
     if [[ -z "$container" ]]; then
         skip "No TEST_CONTAINER specified"
         return
     fi
-    
+
     if [[ -n "${SKIP_CONTAINER:-}" ]]; then
         skip "Container tests disabled (SKIP_CONTAINER set)"
         return
     fi
-    
+
     if ! validate_container_once; then
         skip "Container prerequisites not met"
         return
     fi
-    
+
     # Setup clean staging
     local int_staging="${TEST_STAGING}/integration-list"
     mkdir -p "$int_staging"
-    
+
     # Run extraction with real incus
     local output rc
     run_extract_real output rc "$container" "$int_staging" "--file-list" "$TEST_FILELIST"
-    
+
     if [[ $rc -eq 0 ]] && [[ -f "$int_staging/etc/hostname" ]]; then
         pass "File list extraction succeeded"
     else
@@ -698,35 +698,35 @@ test_integration_file_list() {
 test_integration_uid_preservation() {
     log_test "Integration: Verify UID preservation in extraction"
     ((TESTS_RUN++))
-    
+
     local container="${TEST_CONTAINER:-}"
     if [[ -z "$container" ]]; then
         skip "No TEST_CONTAINER specified"
         return
     fi
-    
+
     if [[ -n "${SKIP_CONTAINER:-}" ]]; then
         skip "Container tests disabled (SKIP_CONTAINER set)"
         return
     fi
-    
+
     if ! validate_container_once; then
         skip "Container prerequisites not met"
         return
     fi
-    
+
     # Setup clean staging
     local int_staging="${TEST_STAGING}/integration-uid"
     mkdir -p "$int_staging"
-    
+
     # Run extraction with real incus
     local output rc
     run_extract_real output rc "$container" "$int_staging" "etc/passwd"
-    
+
     # Check that files have container-shifted UIDs (100000+ for unprivileged containers)
     local uid
     uid=$(stat -c '%u' "$int_staging/etc/passwd" 2>/dev/null || echo "0")
-    
+
     if [[ $uid -ge 100000 ]] || [[ $uid -eq 0 ]]; then
         pass "UID preserved (uid=$uid)"
     else
@@ -737,32 +737,32 @@ test_integration_uid_preservation() {
 test_integration_nonexistent_path() {
     log_test "Integration: Non-existent path should fail extraction"
     ((TESTS_RUN++))
-    
+
     local container="${TEST_CONTAINER:-}"
     if [[ -z "$container" ]]; then
         skip "No TEST_CONTAINER specified"
         return
     fi
-    
+
     if [[ -n "${SKIP_CONTAINER:-}" ]]; then
         skip "Container tests disabled (SKIP_CONTAINER set)"
         return
     fi
-    
+
     if ! validate_container_once; then
         skip "Container prerequisites not met"
         return
     fi
-    
+
     # Setup clean staging
     local int_staging="${TEST_STAGING}/integration-nonexistent"
     mkdir -p "$int_staging"
-    
+
     # Request a path that definitely does not exist
     # Current behavior: script should fail (exit code 5 = extraction error)
     local output rc
     run_extract_real output rc "$container" "$int_staging" "this/path/does/not/exist/anywhere-$RANDOM"
-    
+
     if [[ $rc -ne 0 ]]; then
         pass "Non-existent path correctly failed (rc=$rc)"
         echo -e "  INFO: Non-existent path handling: rc=$rc, msg=\n${output}"
@@ -775,16 +775,16 @@ test_integration_nonexistent_path() {
 test_integration_container_not_running() {
     log_test "Integration: Real non-existent container should fail"
     ((TESTS_RUN++))
-    
+
     if [[ -n "${SKIP_CONTAINER:-}" ]]; then
         skip "Container tests disabled (SKIP_CONTAINER set)"
         return
     fi
-    
+
     # Use real incus to verify non-existent container handling
     local output rc
     run_extract_real output rc "nonexistent-container-xyz-12345" "$TEST_STAGING/service1" "etc"
-    
+
     if [[ $rc -eq 4 ]] || echo "$output" | grep -q "does not exist"; then
         pass "Real non-existent container rejected (exit 4)"
     else
@@ -803,37 +803,37 @@ main() {
     echo "Project root: $PROJECT_ROOT"
     echo "Script under test: $EXTRACT_SCRIPT"
     echo "Running as: root"
-    
+
     if [[ ! -x "$EXTRACT_SCRIPT" ]]; then
         echo -e "${RED}ERROR: Script not found or not executable: $EXTRACT_SCRIPT${NC}"
         exit 1
     fi
-    
+
     if [[ -n "${TEST_CONTAINER:-}" ]]; then
         echo "Test container: $TEST_CONTAINER"
     else
         echo "Test container: (not specified, integration tests will be skipped)"
     fi
-    
+
     echo "============================================="
-    
+
     # Setup
     setup
     trap cleanup EXIT
-    
+
     echo ""
     echo "--- Unit Tests: Argument Validation ---"
     test_no_arguments
     test_missing_paths
     test_file_list_missing_file
-    
+
     echo ""
     echo "--- Unit Tests: Configuration Validation ---"
     test_missing_config
     test_config_bad_owner
     test_config_world_writable
     test_empty_config
-    
+
     echo ""
     echo "--- Unit Tests: Security Validation ---"
     test_staging_not_under_root
@@ -842,16 +842,16 @@ main() {
     test_container_path_absolute
     test_container_path_empty
     test_staging_dir_not_exist
-    
+
     echo ""
     echo "--- Unit Tests: Container Validation ---"
     test_container_not_found
-    
+
     echo ""
     echo "--- Unit Tests: File List Validation ---"
     test_file_list_not_found
     test_file_list_empty
-    
+
     echo ""
     echo "--- Integration Tests (require TEST_CONTAINER) ---"
     test_integration_single_path
@@ -860,12 +860,12 @@ main() {
     test_integration_uid_preservation
     test_integration_nonexistent_path
     test_integration_container_not_running
-    
+
     echo ""
     echo "============================================="
     echo -e "Results: ${GREEN}${TESTS_PASSED} passed${NC}, ${RED}${TESTS_FAILED} failed${NC}, ${YELLOW}${TESTS_SKIPPED} skipped${NC}"
     echo "============================================="
-    
+
     if [[ $TESTS_FAILED -gt 0 ]]; then
         exit 1
     fi

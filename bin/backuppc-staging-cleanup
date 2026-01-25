@@ -14,7 +14,7 @@
 # Security model:
 #   - Allowlist: Only directories under roots defined in /etc/backuppc/staging.conf
 #   - Depth check: Target must be at least 2 levels below an allowed root
-#   - Config validation: staging-roots.conf must be root-owned
+#   - Config validation: staging.conf must be root-owned
 #   - Path canonicalization: Prevents symlink traversal attacks
 #   - Single purpose: No flags, only one argument (the directory)
 #
