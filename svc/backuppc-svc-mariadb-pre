@@ -1,0 +1,626 @@
+#!/bin/bash
+# =============================================================================
+# /usr/local/bin/backuppc-svc-mariadb-pre
+# =============================================================================
+#
+# BackupPC pre-backup script for MariaDB central database service.
+# Prepares staging directory with instance-level backup artifacts for
+# complete disaster recovery.
+#
+# Schedule: Weekly Sunday 02:00 (via BackupPC DumpPreUserCmd)
+#
+# This script:
+#   1. Extracts container /etc configuration
+#   2. Dumps mysql system database (users, grants, proxies)
+#   3. Generates human-readable grants for verification
+#   4. Captures instance metadata
+#   5. Flushes, archives, and purges binary logs
+#
+# Staging structure:
+#   /export/mariadb/backuppc/server/
+#   ├── config/           # Container /etc extraction
+#   ├── db/               # mysql-system.sql.zst, users-grants.sql
+#   │   └── binlogs/      # mysql-bin.*.zst, position files
+#   └── meta/             # instance-metadata.txt
+#
+# Dependencies:
+#   - common.sh library
+#   - backuppc-staging-extract helper
+#   - backuppc-staging-cleanup helper
+#   - MySQL client tools (mariadb, mariadb-dump, mariadb-admin)
+#   - zstd compression
+#
+# Required MySQL grants for BackupMeta user:
+#   GRANT SELECT, SHOW VIEW ON mysql.* TO 'BackupMeta'@'...';
+#   GRANT EVENT ON mysql.* TO 'BackupMeta'@'...';
+#   GRANT CREATE USER ON *.* TO 'BackupMeta'@'...';
+#   GRANT RELOAD, PROCESS, BINLOG MONITOR ON *.* TO 'BackupMeta'@'...';
+#
+# Exit codes:
+#   0  - Success
+#   1  - General failure
+#   2  - Missing dependency or configuration
+#   3  - Database unreachable
+#   4  - Container error
+#   5  - Extraction/dump failure
+#   10 - Lock acquisition failed
+#
+# =============================================================================
+
+# Script identification (before sourcing common.sh)
+SCRIPT_NAME="backuppc-svc-mariadb-pre"
+
+# Source shared library
+# shellcheck source=/usr/local/lib/backuppc/common.sh
+source /usr/local/lib/backuppc/common.sh
+
+# Enable comprehensive error handling
+enable_strict_traps
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Container name
+readonly APP_CT="mariadb"
+
+# MySQL credentials file (--defaults-file format)
+readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
+
+# Staging directory (on fast LVM, not under /srv/backuppc/services)
+readonly STAGING_DIR="/export/mariadb/backuppc/server"
+
+# Subdirectories
+readonly CONFIG_DIR="${STAGING_DIR}/config"
+readonly DB_DIR="${STAGING_DIR}/db"
+readonly BINLOG_DIR="${DB_DIR}/binlogs"
+readonly META_DIR="${STAGING_DIR}/meta"
+
+# Paths to extract from container
+readonly -a EXTRACT_PATHS=(
+    "etc/my.cnf"
+    "etc/my.cnf.d"
+    "etc/mysql"
+    "etc/pam.d/mysql"
+)
+
+# =============================================================================
+# Script-specific functions
+# =============================================================================
+
+# Check database connectivity
+check_database() {
+    log "Checking database connectivity"
+    local db_errors
+    db_errors=$(mktemp) || fail 3 "Failed to create temp file"
+    register_cleanup "rm -f '$db_errors'"
+
+    if ! mariadb-admin --defaults-file="$MYSQL_CONFIG_FILE" ping 2>"$db_errors"; then
+        if [[ -s "$db_errors" ]]; then
+            error "mariadb-admin stderr:"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$db_errors"
+        fi
+        fail 3 "Database not reachable (check credentials in $MYSQL_CONFIG_FILE)"
+    fi
+    log "Database is responsive"
+}
+
+# Prepare staging directory structure
+prepare_staging() {
+    log "Preparing staging directories"
+
+    # Clean existing content using privileged helper
+    for dir in "$CONFIG_DIR" "$DB_DIR" "$META_DIR"; do
+        if [[ -d "$dir" ]]; then
+            cleanup_staging "$dir"
+        fi
+    done
+
+    # Create directory structure
+    ensure_staging_dir "$CONFIG_DIR"
+    ensure_staging_dir "$DB_DIR"
+    ensure_staging_dir "$BINLOG_DIR"
+    ensure_staging_dir "$META_DIR"
+
+    log "Staging directories ready"
+}
+
+# Extract container configuration
+extract_config() {
+    PHASE="extract_config"
+    log "Extracting container configuration"
+
+    # Build list of paths that exist
+    local -a paths_to_extract=()
+    for path in "${EXTRACT_PATHS[@]}"; do
+        # Check if path exists in container
+        if incus exec "$APP_CT" -- test -e "/$path" 2>/dev/null; then
+            paths_to_extract+=("$path")
+        else
+            warn "Path not found in container, skipping: /$path"
+        fi
+    done
+
+    if [[ ${#paths_to_extract[@]} -eq 0 ]]; then
+        fail 5 "No configuration paths found in container"
+    fi
+
+    # Use staging extract helper
+    backuppc-staging-extract "$APP_CT" "$CONFIG_DIR" "${paths_to_extract[@]}" \
+        || fail 5 "Failed to extract container configuration"
+
+    log "Configuration extraction complete"
+}
+
+# Dump MySQL system database with strict error handling
+dump_system_database() {
+    PHASE="dump_system_db"
+    log "Dumping mysql system database"
+
+    timer_start "mysql_dump"
+
+    # Temp file for capturing stderr
+    local dump_errors
+    dump_errors=$(mktemp) || fail 5 "Failed to create temp file for error capture"
+    register_cleanup "rm -f '$dump_errors'"
+
+    # Full mysql.* dump (users, grants, proxies, plugins, time zones)
+    if ! mariadb-dump \
+        --defaults-file="$MYSQL_CONFIG_FILE" \
+        --single-transaction \
+        --routines \
+        --events \
+        --triggers \
+        mysql 2>"$dump_errors" \
+        | zstd -19 -T0 > "${DB_DIR}/mysql-system.sql.zst"; then
+
+        if [[ -s "$dump_errors" ]]; then
+            error "mariadb-dump stderr:"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$dump_errors"
+        fi
+        fail 5 "Failed to dump mysql system database"
+    fi
+
+    # Check for warnings even on success
+    if [[ -s "$dump_errors" ]]; then
+        warn "mariadb-dump produced warnings:"
+        while IFS= read -r line; do
+            warn "  $line"
+        done < "$dump_errors"
+    fi
+
+    timer_log "mysql_dump" "System database dump completed"
+
+    # -------------------------------------------------------------------------
+    # Generate human-readable grants for verification (uncompressed)
+    # -------------------------------------------------------------------------
+    # SECURITY NOTE: This file contains password hashes and privilege details.
+    # Ensure staging directory has appropriate permissions (0750 or stricter).
+    # -------------------------------------------------------------------------
+    PHASE="grants_export"
+    log "Generating human-readable grants"
+
+    local grants_file="${DB_DIR}/users-grants.sql"
+    local grants_errors
+    grants_errors=$(mktemp) || fail 5 "Failed to create temp file for grants errors"
+    register_cleanup "rm -f '$grants_errors'"
+
+    # Header
+    {
+        echo "-- ============================================================================"
+        echo "-- MariaDB User Grants Export"
+        echo "-- ============================================================================"
+        echo "-- Generated: $(date -Iseconds)"
+        echo "-- Host: $(hostname)"
+        echo "-- Container: ${APP_CT}"
+        echo "-- "
+        echo "-- SECURITY: This file contains password hashes and privilege information."
+        echo "-- ============================================================================"
+        echo ""
+    } > "$grants_file"
+
+    # Get user list (fail on error)
+    local users_list
+    if ! users_list=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -B -e "
+        SELECT CONCAT(user,'@',host) FROM mysql.user
+        WHERE user NOT IN ('mariadb.sys', 'mysql', '')
+        ORDER BY user, host" 2>"$grants_errors"); then
+        error "Failed to query user list:"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$grants_errors"
+        fail 5 "Cannot retrieve MySQL user list"
+    fi
+
+    # Process each user
+    local user_count=0
+    while IFS= read -r uh; do
+        [[ -z "$uh" ]] && continue
+        ((user_count++))
+
+        {
+            echo "-- ============================================"
+            echo "-- User: $uh"
+            echo "-- ============================================"
+        } >> "$grants_file"
+
+        # SHOW CREATE USER (fail on error)
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+            "SHOW CREATE USER '$uh';" >> "$grants_file" 2>"$grants_errors"; then
+            error "SHOW CREATE USER failed for '$uh':"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$grants_errors"
+            fail 5 "Cannot show create user: $uh (grant CREATE USER ON *.* required)"
+        fi
+        echo ";" >> "$grants_file"
+
+        # SHOW GRANTS FOR (fail on error)
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+            "SHOW GRANTS FOR '$uh';" 2>"$grants_errors" \
+            | sed 's/$/;/' >> "$grants_file"; then
+            error "SHOW GRANTS FOR failed for '$uh':"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$grants_errors"
+            fail 5 "Cannot show grants for: $uh"
+        fi
+        echo "" >> "$grants_file"
+
+    done <<< "$users_list"
+
+    log "Exported $user_count user(s)"
+
+    # Anonymous users (PAM) - separate section
+    {
+        echo "-- ============================================"
+        echo "-- Anonymous Users (PAM authentication)"
+        echo "-- ============================================"
+    } >> "$grants_file"
+
+    local anon_list
+    if ! anon_list=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -B -e "
+        SELECT CONCAT('''',user,'''@''',host,'''') FROM mysql.user WHERE user = ''" 2>"$grants_errors"); then
+        error "Failed to query anonymous users:"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$grants_errors"
+        fail 5 "Cannot retrieve anonymous user list"
+    fi
+
+    local anon_count=0
+    while IFS= read -r uh; do
+        [[ -z "$uh" ]] && continue
+        ((anon_count++))
+        echo "-- Anonymous: $uh" >> "$grants_file"
+
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+            "SHOW GRANTS FOR $uh;" 2>"$grants_errors" \
+            | sed 's/$/;/' >> "$grants_file"; then
+            error "SHOW GRANTS FOR anonymous user failed for $uh:"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$grants_errors"
+            fail 5 "Cannot show grants for anonymous user: $uh"
+        fi
+        echo "" >> "$grants_file"
+    done <<< "$anon_list"
+
+    if [[ $anon_count -gt 0 ]]; then
+        log "Exported $anon_count anonymous user(s)"
+    fi
+
+    # Proxy privileges
+    {
+        echo "-- ============================================"
+        echo "-- Proxy Privileges"
+        echo "-- ============================================"
+    } >> "$grants_file"
+
+    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e \
+        "SELECT * FROM mysql.proxies_priv WHERE proxied_host != '';" >> "$grants_file" 2>"$grants_errors"; then
+        error "Failed to query proxy privileges:"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$grants_errors"
+        fail 5 "Cannot retrieve proxy privileges"
+    fi
+
+    log "Grants export complete: $grants_file"
+}
+
+# Capture instance metadata
+capture_metadata() {
+    PHASE="capture_metadata"
+    log "Capturing instance metadata"
+
+    local meta_errors
+    meta_errors=$(mktemp) || fail 5 "Failed to create temp file"
+    register_cleanup "rm -f '$meta_errors'"
+
+    local meta_file="${META_DIR}/instance-metadata.txt"
+
+    {
+        echo "=== MariaDB Instance Metadata ==="
+        echo "Backup Date: $(date -Iseconds)"
+        echo "Host: $(hostname)"
+        echo "Container: ${APP_CT}"
+        echo ""
+
+        echo "=== Version ==="
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e "SELECT VERSION();" 2>"$meta_errors"; then
+            echo "(failed to retrieve version)"
+            warn "Failed to get MariaDB version"
+        fi
+        echo ""
+
+        echo "=== Databases ==="
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "
+            SELECT table_schema AS 'Database',
+                   ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS 'Size_MB'
+            FROM information_schema.tables
+            GROUP BY table_schema
+            ORDER BY Size_MB DESC;" 2>"$meta_errors"; then
+            echo "(failed to retrieve database list)"
+            warn "Failed to get database sizes"
+        fi
+        echo ""
+
+        echo "=== Binary Log Position ==="
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW MASTER STATUS\G" 2>"$meta_errors"; then
+            echo "(failed to retrieve binary log position)"
+            warn "Failed to get master status"
+        fi
+        echo ""
+
+        echo "=== Replication Status ==="
+        # This may legitimately fail if not a replica
+        mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW SLAVE STATUS\G" 2>/dev/null \
+            || echo "(not a replica)"
+        echo ""
+
+        echo "=== Key Global Variables ==="
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e "
+            SHOW GLOBAL VARIABLES WHERE Variable_name IN (
+                'innodb_buffer_pool_size',
+                'max_connections',
+                'log_bin',
+                'binlog_format',
+                'server_id',
+                'gtid_mode',
+                'character_set_server',
+                'collation_server',
+                'datadir',
+                'socket'
+            );" 2>"$meta_errors"; then
+            echo "(failed to retrieve global variables)"
+            warn "Failed to get global variables"
+        fi
+        echo ""
+
+        echo "=== Installed Plugins ==="
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW PLUGINS;" 2>"$meta_errors" \
+            | grep -E 'ACTIVE|Name'; then
+            echo "(failed to retrieve plugins)"
+            warn "Failed to get plugins"
+        fi
+        echo ""
+
+        echo "=== DEFINERs in Use ==="
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e "
+            SELECT DISTINCT DEFINER, 'VIEW' AS type FROM information_schema.VIEWS
+            UNION
+            SELECT DISTINCT DEFINER, 'TRIGGER' FROM information_schema.TRIGGERS
+            UNION
+            SELECT DISTINCT DEFINER, 'ROUTINE' FROM information_schema.ROUTINES
+            UNION
+            SELECT DISTINCT DEFINER, 'EVENT' FROM information_schema.EVENTS
+            ORDER BY DEFINER;" 2>"$meta_errors"; then
+            echo "(failed to retrieve definers)"
+            warn "Failed to get definers"
+        fi
+
+    } > "$meta_file"
+
+    log "Metadata capture complete: $meta_file"
+}
+
+# Flush and archive binary logs
+process_binlogs() {
+    PHASE="process_binlogs"
+    log "Processing binary logs"
+
+    local binlog_errors
+    binlog_errors=$(mktemp) || fail 5 "Failed to create temp file"
+    register_cleanup "rm -f '$binlog_errors'"
+
+    # Check if binary logging is enabled
+    local binlog_enabled
+    if ! binlog_enabled=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+        "SELECT @@log_bin;" 2>"$binlog_errors"); then
+        error "Failed to check binary logging status:"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$binlog_errors"
+        fail 5 "Cannot determine binary logging status"
+    fi
+
+    if [[ "$binlog_enabled" != "1" ]]; then
+        log "Binary logging not enabled, skipping binlog processing"
+        return 0
+    fi
+
+    # Record position BEFORE flush
+    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW MASTER STATUS\G" \
+        > "${BINLOG_DIR}/pre-flush-position.txt" 2>"$binlog_errors"; then
+        warn "Failed to record pre-flush position"
+    fi
+
+    # Flush to rotate to new binlog
+    log "Flushing binary logs"
+    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "FLUSH BINARY LOGS;" 2>"$binlog_errors"; then
+        error "Failed to flush binary logs:"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$binlog_errors"
+        fail 5 "Failed to flush binary logs (grant RELOAD required)"
+    fi
+
+    # Get current binlog (the one just created, which we won't archive)
+    local current_binlog
+    current_binlog=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+        "SHOW MASTER STATUS;" 2>/dev/null | awk '{print $1}')
+
+    # Get binlog base directory
+    local binlog_basename binlog_basedir
+    binlog_basename=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+        "SELECT @@log_bin_basename;" 2>/dev/null)
+    binlog_basedir=$(dirname "$binlog_basename")
+
+    log "Current binlog: ${current_binlog} (will not archive)"
+    log "Binlog directory: ${binlog_basedir}"
+
+    # Archive old binlogs (all except current)
+    local archived=0
+    local archive_errors=0
+    for binlog in "$binlog_basedir"/mysql-bin.[0-9]*; do
+        [[ -f "$binlog" ]] || continue
+        local binlog_name
+        binlog_name=$(basename "$binlog")
+
+        # Skip current binlog
+        [[ "$binlog_name" == "$current_binlog" ]] && continue
+
+        # Skip if already archived
+        [[ -f "${BINLOG_DIR}/${binlog_name}.zst" ]] && continue
+
+        log "  Archiving: ${binlog_name}"
+        if zstd -19 -T0 "$binlog" -o "${BINLOG_DIR}/${binlog_name}.zst" 2>"$binlog_errors"; then
+            ((archived++))
+        else
+            error "Failed to archive binlog ${binlog_name}:"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$binlog_errors"
+            ((archive_errors++))
+        fi
+    done
+
+    log "Archived ${archived} binlog file(s)"
+    if [[ $archive_errors -gt 0 ]]; then
+        fail 5 "Failed to archive $archive_errors binlog file(s)"
+    fi
+
+    # Record position AFTER flush
+    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW MASTER STATUS\G" \
+        > "${BINLOG_DIR}/post-flush-position.txt" 2>"$binlog_errors"; then
+        warn "Failed to record post-flush position"
+    fi
+
+    # Purge old binlogs from server (keep last 3 for safety)
+    local purge_to
+    purge_to=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+        "SHOW BINARY LOGS;" 2>/dev/null | tail -4 | head -1 | awk '{print $1}')
+
+    if [[ -n "$purge_to" ]]; then
+        log "Purging server binlogs older than: ${purge_to}"
+        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e \
+            "PURGE BINARY LOGS TO '$purge_to';" 2>"$binlog_errors"; then
+            warn "Failed to purge binary logs:"
+            while IFS= read -r line; do
+                warn "  $line"
+            done < "$binlog_errors"
+            # Not fatal - binlogs will be purged by expire_logs_days
+        fi
+    fi
+
+    log "Binlog processing complete"
+}
+
+# Generate summary report
+generate_summary() {
+    PHASE="summary"
+    log "Generating backup summary"
+
+    log "=== Backup Summary ==="
+    log "Staging directory: ${STAGING_DIR}"
+
+    if [[ -f "${DB_DIR}/mysql-system.sql.zst" ]]; then
+        log "  mysql-system.sql.zst: $(du -h "${DB_DIR}/mysql-system.sql.zst" | cut -f1)"
+    fi
+
+    if [[ -f "${DB_DIR}/users-grants.sql" ]]; then
+        log "  users-grants.sql: $(du -h "${DB_DIR}/users-grants.sql" | cut -f1)"
+    fi
+
+    local binlog_count
+    binlog_count=$(find "$BINLOG_DIR" -name "*.zst" -type f 2>/dev/null | wc -l)
+    log "  Archived binlogs: ${binlog_count}"
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        log "  Config files: $(find "$CONFIG_DIR" -type f 2>/dev/null | wc -l) files"
+    fi
+
+    if [[ -f "${META_DIR}/instance-metadata.txt" ]]; then
+        log "  Metadata: $(du -h "${META_DIR}/instance-metadata.txt" | cut -f1)"
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    log "==== ${SCRIPT_NAME} started ===="
+    timer_start "total"
+
+    # Acquire exclusive lock
+    acquire_lock
+
+    # Validate prerequisites
+    PHASE="validate"
+    require_file "$MYSQL_CONFIG_FILE"
+    require_command mariadb
+    require_command mariadb-dump
+    require_command mariadb-admin
+    require_command zstd
+    require_command incus
+    require_command backuppc-staging-extract
+
+    # Check container is running
+    if ! container_running "$APP_CT"; then
+        fail 4 "Container not running: ${APP_CT}"
+    fi
+
+    # Check database connectivity
+    check_database
+
+    # Prepare staging directories
+    PHASE="prepare"
+    prepare_staging
+
+    # Extract container configuration
+    extract_config
+
+    # Dump mysql system database
+    dump_system_database
+
+    # Capture metadata
+    capture_metadata
+
+    # Process binary logs
+    process_binlogs
+
+    # Summary
+    generate_summary
+
+    timer_log "total" "Pre-backup completed"
+
+    # Exit handled by on_exit trap
+}
+
+main "$@"

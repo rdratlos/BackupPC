@@ -1,0 +1,5 @@
+[client]
+host = mariadb.example.com
+user = BackupMeta
+password = <a-strong-secret>
+ssl
