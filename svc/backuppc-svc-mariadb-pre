@@ -240,7 +240,7 @@ dump_system_database() {
     local user_count=0
     while IFS= read -r uh; do
         [[ -z "$uh" ]] && continue
-        ((user_count++))
+        user_count=$((user_count + 1))
 
         {
             echo "-- ============================================"
