@@ -228,7 +228,7 @@ dump_system_database() {
     if ! users_list=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -B -e "
         SELECT CONCAT(user,'@',host) FROM mysql.user
         WHERE user NOT IN ('mariadb.sys', 'mysql', '')
-        ORDER BY user, host" 2>"$grants_errors"); then
+        ORDER BY user, host;" 2>"$grants_errors"); then
         error "Failed to query user list:"
         while IFS= read -r line; do
             error "  $line"
