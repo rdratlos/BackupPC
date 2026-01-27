@@ -67,7 +67,7 @@ readonly APP_CT="mariadb"
 # MySQL credentials file (--defaults-file format)
 readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
 
-# Staging directory (on fast LVM, not under /srv/backuppc/services)
+# Staging directory (on fast LVM)
 readonly STAGING_DIR="/export/mariadb/backuppc/server"
 
 # Subdirectories
@@ -208,6 +208,8 @@ dump_system_database() {
     local grants_errors
     grants_errors=$(mktemp) || fail 5 "Failed to create temp file for grants errors"
     register_cleanup "rm -f '$grants_errors'"
+    local grants_out=""
+    local rc=0
 
     # Header
     {
@@ -226,7 +228,12 @@ dump_system_database() {
     # Get user list (fail on error)
     local users_list
     if ! users_list=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -B -e "
-        SELECT CONCAT(user,'@',host) FROM mysql.user
+        SELECT
+        CASE
+            WHEN user='PUBLIC' THEN 'PUBLIC'
+            ELSE CONCAT(QUOTE(user),'@',QUOTE(host))
+        END AS uh
+        FROM mysql.user
         WHERE user NOT IN ('mariadb.sys', 'mysql', '')
         ORDER BY user, host;" 2>"$grants_errors"); then
         error "Failed to query user list:"
@@ -249,25 +256,35 @@ dump_system_database() {
         } >> "$grants_file"
 
         # SHOW CREATE USER (fail on error)
-        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
-            "SHOW CREATE USER '$uh';" >> "$grants_file" 2>"$grants_errors"; then
-            error "SHOW CREATE USER failed for '$uh':"
-            while IFS= read -r line; do
-                error "  $line"
-            done < "$grants_errors"
-            fail 5 "Cannot show create user: $uh (grant CREATE USER ON *.* required)"
+        rc=0
+        if [[ "$uh" != "PUBLIC" ]]; then
+            grants_out=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+                "SHOW CREATE USER $uh;" 2>"$grants_errors") || rc=$?
+
+            if [[ $rc -ne 0 ]]; then
+                error "SHOW CREATE USER failed for '$uh':"
+                while IFS= read -r line; do
+                    error "  $line"
+                done < "$grants_errors"
+                fail 5 "Cannot show create user: $uh (grant CREATE USER ON *.* required)"
+            fi
+            echo "$grants_out;" >> "$grants_file"
         fi
-        echo ";" >> "$grants_file"
 
         # SHOW GRANTS FOR (fail on error)
-        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
-            "SHOW GRANTS FOR '$uh';" 2>"$grants_errors" \
-            | sed 's/$/;/' >> "$grants_file"; then
+        rc=0
+        grants_out=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+            "SHOW GRANTS FOR $uh;" 2>"$grants_errors") || rc=$?
+        if [[ $rc -ne 0 ]]; then
             error "SHOW GRANTS FOR failed for '$uh':"
             while IFS= read -r line; do
                 error "  $line"
             done < "$grants_errors"
             fail 5 "Cannot show grants for: $uh"
+        fi
+
+        if [[ -n "$grants_out" ]]; then
+            echo "$grants_out" | sed 's/$/;/' >> "$grants_file"
         fi
         echo "" >> "$grants_file"
 
@@ -295,17 +312,23 @@ dump_system_database() {
     local anon_count=0
     while IFS= read -r uh; do
         [[ -z "$uh" ]] && continue
-        ((anon_count++))
+        anon_count=$((user_count + 1))
         echo "-- Anonymous: $uh" >> "$grants_file"
 
-        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
-            "SHOW GRANTS FOR $uh;" 2>"$grants_errors" \
-            | sed 's/$/;/' >> "$grants_file"; then
+        # SHOW GRANTS FOR (fail on error)
+        rc=0
+        grants_out=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+            "SHOW GRANTS FOR $uh;" 2>"$grants_errors") || rc=$?
+        if [[ $rc -ne 0 ]]; then
             error "SHOW GRANTS FOR anonymous user failed for $uh:"
             while IFS= read -r line; do
                 error "  $line"
             done < "$grants_errors"
             fail 5 "Cannot show grants for anonymous user: $uh"
+        fi
+
+        if [[ -n "$grants_out" ]]; then
+            echo "$grants_out" | sed 's/$/;/' >> "$grants_file"
         fi
         echo "" >> "$grants_file"
     done <<< "$anon_list"
@@ -321,14 +344,21 @@ dump_system_database() {
         echo "-- ============================================"
     } >> "$grants_file"
 
-    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e \
-        "SELECT * FROM mysql.proxies_priv WHERE proxied_host != '';" >> "$grants_file" 2>"$grants_errors"; then
+    rc=0
+    grants_out=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e \
+        "SELECT * FROM mysql.proxies_priv WHERE proxied_host != '';" 2>"$grants_errors") || rc=$?
+    if [[ $rc -ne 0 ]]; then
         error "Failed to query proxy privileges:"
         while IFS= read -r line; do
             error "  $line"
         done < "$grants_errors"
         fail 5 "Cannot retrieve proxy privileges"
     fi
+
+    if [[ -n "$grants_out" ]]; then
+        echo "$grants_out" >> "$grants_file"
+    fi
+    echo "" >> "$grants_file"
 
     log "Grants export complete: $grants_file"
 }
