@@ -457,6 +457,21 @@ wait_container_ready() {
     fail 5 "Timeout waiting for container $container (${timeout}s)"
 }
 
+# require_command: Ensure command is available in container
+# Usage: require_container_command <container> <cmd>
+require_container_command() {
+    local container="$1"
+    local cmd="$2"
+
+    if [[ -z "$container" || -z "$cmd" ]]; then
+        fail 2 "require_container_command: requires <container> <cmd>"
+    fi
+
+    if ! incus exec "$container" -- sh -c "command -v $cmd &>/dev/null"; then
+        fail 2 "Required command not found in container $container: $cmd"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Validation helpers
 # -----------------------------------------------------------------------------

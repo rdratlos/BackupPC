@@ -64,6 +64,10 @@ enable_strict_traps
 # Container name
 readonly APP_CT="mariadb"
 
+# MySQL user and group in MariaDB container
+CT_MYSQL_USER="mysql"
+CT_MYSQL_GROUP="mysql"
+
 # MySQL credentials file (--defaults-file format)
 readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
 
@@ -469,10 +473,13 @@ process_binlogs() {
     register_cleanup "rm -f '$binlog_errors'"
 
     # Check if binary logging is enabled
-    local binlog_enabled
-    if ! binlog_enabled=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
-        "SELECT @@log_bin;" 2>"$binlog_errors"); then
-        error "Failed to check binary logging status:"
+    local binlog_enabled=""
+    rc=0
+    binlog_enabled=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+        "SELECT @@log_bin;" 2>"$binlog_errors") || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        error "Failed to check binary logging status (rc=$rc):"
         while IFS= read -r line; do
             error "  $line"
         done < "$binlog_errors"
@@ -484,16 +491,62 @@ process_binlogs() {
         return 0
     fi
 
-    # Record position BEFORE flush
-    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW MASTER STATUS\G" \
-        > "${BINLOG_DIR}/pre-flush-position.txt" 2>"$binlog_errors"; then
-        warn "Failed to record pre-flush position"
+    # Get binlog directory (container path)
+    local binlog_basename=""
+    rc=0
+    binlog_basename=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+        "SELECT @@log_bin_basename;" 2>"$binlog_errors") || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        error "Failed to get binlog basename (rc=$rc):"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$binlog_errors"
+        fail 5 "Cannot determine binlog location"
     fi
+
+    local binlog_dir
+    binlog_dir=$(dirname "$binlog_basename")
+
+    log "Binlog directory (container): $binlog_dir"
+
+    # Container paths
+    local container_meta_dir="${binlog_dir}/backup-meta"
+    local container_staging_dir="${binlog_dir}/db"
+    local container_staging_binlogs="${container_staging_dir}/binlogs"
+
+    # Ensure directories exist in container (owned by mysql)
+    incus exec "$APP_CT" -- mkdir -p "${container_meta_dir}" "${container_staging_binlogs}"
+    incus exec "$APP_CT" -- chown -R "${CT_MYSQL_USER}:${CT_MYSQL_GROUP}" "${container_meta_dir}" "${container_staging_dir}"
+
+    # Record position BEFORE flush
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local position_file="position-${timestamp}.txt"
+
+    log "Recording pre-flush position"
+    rc=0
+    incus exec "$APP_CT" -- sh -c \
+        "mariadb -e 'SHOW MASTER STATUS\G' > '${container_meta_dir}/${position_file}'" 2>"$binlog_errors" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        error "Failed to record pre-flush position (rc=$rc):"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$binlog_errors"
+        fail 5 "Cannot record binlog position"
+    fi
+
+    # Copy position file to staging
+    incus exec "$APP_CT" -- cp -a "${container_meta_dir}/${position_file}" "${container_staging_binlogs}/pre-flush-position.txt" 2>/dev/null
 
     # Flush to rotate to new binlog
     log "Flushing binary logs"
-    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "FLUSH BINARY LOGS;" 2>"$binlog_errors"; then
-        error "Failed to flush binary logs:"
+    rc=0
+    mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "FLUSH BINARY LOGS;" 2>"$binlog_errors" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        error "Failed to flush binary logs (rc=$rc):"
         while IFS= read -r line; do
             error "  $line"
         done < "$binlog_errors"
@@ -501,72 +554,103 @@ process_binlogs() {
     fi
 
     # Get current binlog (the one just created, which we won't archive)
-    local current_binlog
+    local current_binlog=""
+    rc=0
     current_binlog=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
-        "SHOW MASTER STATUS;" 2>/dev/null | awk '{print $1}')
+        "SHOW MASTER STATUS;" 2>"$binlog_errors" | awk '{print $1}') || rc=$?
 
-    # Get binlog base directory
-    local binlog_basename binlog_basedir
-    binlog_basename=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
-        "SELECT @@log_bin_basename;" 2>/dev/null)
-    binlog_basedir=$(dirname "$binlog_basename")
+    if [[ $rc -ne 0 || -z "$current_binlog" ]]; then
+        error "Failed to get current binlog name (rc=$rc)"
+        fail 5 "Cannot determine current binlog"
+    fi
 
     log "Current binlog: ${current_binlog} (will not archive)"
-    log "Binlog directory: ${binlog_basedir}"
+
+
+    # Get list of binlogs to archive (inside container)
+    local -a binlogs
+    mapfile -t binlogs < <(
+        incus exec "$APP_CT" -- sh -c "ls -1 $binlog_dir/mariadb-bin.[0-9]*[0-9] 2>/dev/null" || true
+    )
 
     # Archive old binlogs (all except current)
     local archived=0
+    local archive_skipped=0
     local archive_errors=0
-    for binlog in "$binlog_basedir"/mysql-bin.[0-9]*; do
-        [[ -f "$binlog" ]] || continue
-        local binlog_name
-        binlog_name=$(basename "$binlog")
+    local binlog_name=""
+
+    for binlog_path in "${binlogs[@]}"; do
+        [[ -z "$binlog_path" ]] && continue
+
+        binlog_name=$(basename "$binlog_path")
 
         # Skip current binlog
         [[ "$binlog_name" == "$current_binlog" ]] && continue
 
-        # Skip if already archived
-        [[ -f "${BINLOG_DIR}/${binlog_name}.zst" ]] && continue
+        # Skip if already archived in staging
+        if incus exec "$APP_CT" -- test -f "${container_staging_binlogs}/${binlog_name}.zst" </dev/null; then
+            archive_skipped=$((archive_skipped + 1))
+            continue
+        fi
 
         log "  Archiving: ${binlog_name}"
-        if zstd -19 -T0 "$binlog" -o "${BINLOG_DIR}/${binlog_name}.zst" 2>"$binlog_errors"; then
-            ((archived++))
-        else
-            error "Failed to archive binlog ${binlog_name}:"
+
+        # Compress inside container, write to staging area on same filesystem
+        rc=0
+        incus exec "$APP_CT" -- zstd -19 -T0 \
+            "$binlog_path" \
+            -o "${container_staging_binlogs}/${binlog_name}.zst" </dev/null 2>"$binlog_errors" || rc=$?
+
+        if [[ $rc -ne 0 ]]; then
+            error "Failed to archive ${binlog_name} (rc=$rc):"
             while IFS= read -r line; do
                 error "  $line"
             done < "$binlog_errors"
-            ((archive_errors++))
+            archive_errors=$((archive_errors + 1))
+        else
+            archived=$((archived + 1))
         fi
     done
 
-    log "Archived ${archived} binlog file(s)"
+    log "Archived ${archived} binlog file(s), skipped ${archive_skipped} already existing binlog archive(s)"
+
     if [[ $archive_errors -gt 0 ]]; then
         fail 5 "Failed to archive $archive_errors binlog file(s)"
     fi
 
     # Record position AFTER flush
-    if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW MASTER STATUS\G" \
-        > "${BINLOG_DIR}/post-flush-position.txt" 2>"$binlog_errors"; then
-        warn "Failed to record post-flush position"
+    incus exec "$APP_CT" -- sh -c \
+        "mariadb -e 'SHOW MASTER STATUS\G' > '${container_staging_binlogs}/post-flush-position.txt'" 2>"$binlog_errors" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        warn "Failed to record post-flush position (rc=$rc):"
+        while IFS= read -r line; do
+            warn "  $line"
+        done < "$binlog_errors"
     fi
 
     # Purge old binlogs from server (keep last 3 for safety)
-    local purge_to
+    local purge_to=""
     purge_to=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
         "SHOW BINARY LOGS;" 2>/dev/null | tail -4 | head -1 | awk '{print $1}')
 
     if [[ -n "$purge_to" ]]; then
         log "Purging server binlogs older than: ${purge_to}"
-        if ! mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e \
-            "PURGE BINARY LOGS TO '$purge_to';" 2>"$binlog_errors"; then
-            warn "Failed to purge binary logs:"
+        rc=0
+        mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e \
+            "PURGE BINARY LOGS TO '$purge_to';" 2>"$binlog_errors" || rc=$?
+
+        if [[ $rc -ne 0 ]]; then
+            warn "Failed to purge binary logs (rc=$rc):"
             while IFS= read -r line; do
                 warn "  $line"
             done < "$binlog_errors"
             # Not fatal - binlogs will be purged by expire_logs_days
         fi
     fi
+
+    # Ensure meta and staing files in container are owned by mysql
+    incus exec "$APP_CT" -- chown -R "${CT_MYSQL_USER}:${CT_MYSQL_GROUP}" "${container_meta_dir}" "${container_staging_dir}"
 
     log "Binlog processing complete"
 }
@@ -625,6 +709,9 @@ main() {
     if ! container_running "$APP_CT"; then
         fail 4 "Container not running: ${APP_CT}"
     fi
+
+    # Validate prerequisites
+    require_container_command "${APP_CT}" zstd
 
     # Check database connectivity
     check_database
