@@ -84,8 +84,16 @@ readonly META_DIR="${STAGING_DIR}/meta"
 readonly -a EXTRACT_PATHS=(
     "etc/my.cnf"
     "etc/my.cnf.d"
-    "etc/mysql"
+    "etc/ssl"
     "etc/pam.d/mysql"
+    "etc/pam.d/system-auth"
+    "etc/sssd"
+    "etc/samba"
+    "etc/nsswitch.conf"
+    "etc/krb5.conf"
+    "etc/krb5.keytab"
+    "etc/passwd"
+    "etc/group"
 )
 
 # =============================================================================
@@ -196,6 +204,9 @@ dump_system_database() {
             warn "  $line"
         done < "$dump_errors"
     fi
+
+    # Checksums
+    sha256sum "${DB_DIR}/mysql-system.sql.zst" > "${DB_DIR}/mysql-system.sql.zst.sha256"
 
     timer_log "mysql_dump" "System database dump completed"
 
@@ -523,6 +534,7 @@ process_binlogs() {
     local timestamp
     timestamp=$(date +%Y%m%d-%H%M%S)
     local position_file="position-${timestamp}.txt"
+    local position_file="position-${timestamp}.txt"
 
     log "Recording pre-flush position"
     rc=0
@@ -535,6 +547,16 @@ process_binlogs() {
             error "  $line"
         done < "$binlog_errors"
         fail 5 "Cannot record binlog position"
+    fi
+
+    rc=0
+    mariadb --defaults-file="$MYSQL_CONFIG_FILE" -e "SHOW BINARY LOGS;" > "${DB_DIR}/binary-log-list.txt" 2>"$binlog_errors" || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        warn "Failed to retrieve binary logs list (rc=$rc):"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$binlog_errors"
     fi
 
     # Copy position file to staging
