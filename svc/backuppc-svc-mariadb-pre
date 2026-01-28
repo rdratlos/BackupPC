@@ -74,6 +74,11 @@ readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
 # Staging directory (on fast LVM)
 readonly STAGING_DIR="/export/mariadb/backuppc/server"
 
+# Service bind-mount configuration
+SERVICE_NAME="mariadb"
+VIEW_ROOT="/srv/backuppc/services"
+VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
+
 # Subdirectories
 readonly CONFIG_DIR="${STAGING_DIR}/config"
 readonly DB_DIR="${STAGING_DIR}/db"
@@ -159,6 +164,8 @@ extract_config() {
         fail 5 "No configuration paths found in container"
     fi
 
+    # Clean old extracted folder before extracting (robust against non-writable dirs)
+    backuppc-staging-cleanup "$CONFIG_DIR"
     # Use staging extract helper
     backuppc-staging-extract "$APP_CT" "$CONFIG_DIR" "${paths_to_extract[@]}" \
         || fail 5 "Failed to extract container configuration"
@@ -206,7 +213,9 @@ dump_system_database() {
     fi
 
     # Checksums
-    sha256sum "${DB_DIR}/mysql-system.sql.zst" > "${DB_DIR}/mysql-system.sql.zst.sha256"
+    sha256sum -b "${DB_DIR}/mysql-system.sql.zst" \
+    | awk '{print $1, "mysql-system.sql.zst"}' \
+    > "${DB_DIR}/mysql-system.sql.zst.sha256"
 
     timer_log "mysql_dump" "System database dump completed"
 
@@ -239,6 +248,7 @@ dump_system_database() {
         echo "-- ============================================================================"
         echo ""
     } > "$grants_file"
+    chmod 640 "$grants_file"
 
     # Get user list (fail on error)
     local users_list
@@ -684,6 +694,7 @@ generate_summary() {
 
     log "=== Backup Summary ==="
     log "Staging directory: ${STAGING_DIR}"
+    log "View directory:    ${VIEW_DIR}"
 
     if [[ -f "${DB_DIR}/mysql-system.sql.zst" ]]; then
         log "  mysql-system.sql.zst: $(du -h "${DB_DIR}/mysql-system.sql.zst" | cut -f1)"
@@ -703,6 +714,18 @@ generate_summary() {
 
     if [[ -f "${META_DIR}/instance-metadata.txt" ]]; then
         log "  Metadata: $(du -h "${META_DIR}/instance-metadata.txt" | cut -f1)"
+    fi
+
+    if [[ -f "${STAGING_DIR}/package-list" ]]; then
+        log "  Installed packages: $(cat "${STAGING_DIR}/package-list/pkglist-repo.txt" | wc -l)"
+    fi
+
+    if [[ -f "${STAGING_DIR}/systemd-list/systemd-enabled.txt" ]]; then
+        log "  Systemd enabled units: $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c "abled$")"
+        log "    Enabled services:      $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.service')"
+        log "    Enabled timers:        $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.timer')"
+        log "    Enabled sockets:       $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.socket')"
+        log "    Enabled targets:       $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.target')"
     fi
 }
 
@@ -726,6 +749,7 @@ main() {
     require_command zstd
     require_command incus
     require_command backuppc-staging-extract
+    require_command sha256sum
 
     # Check container is running
     if ! container_running "$APP_CT"; then
@@ -734,6 +758,9 @@ main() {
 
     # Validate prerequisites
     require_container_command "${APP_CT}" zstd
+    require_container_command "${APP_CT}" pacman
+    require_container_command "${APP_CT}" systemctl
+    require_container_command "${APP_CT}" wc
 
     # Check database connectivity
     check_database
@@ -741,6 +768,10 @@ main() {
     # Prepare staging directories
     PHASE="prepare"
     prepare_staging
+
+    # Ensure bind mount exists for BackupPC view
+    PHASE="bind_mount_prepare"
+    ensure_bind_mount "$STAGING_DIR" "$VIEW_DIR"
 
     # Extract container configuration
     extract_config
@@ -753,6 +784,15 @@ main() {
 
     # Process binary logs
     process_binlogs
+
+    # Capture package lists
+    PHASE="package_list_dump"
+    capture_container_package_lists "$APP_CT" "${STAGING_DIR}/package-list"
+
+    # Capture Systemd service list
+    PHASE="systemd_service_dump"
+    log "Capturing Systemd enabled services"
+    incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled > "${STAGING_DIR}/systemd-list/systemd-enabled.txt"
 
     # Summary
     generate_summary

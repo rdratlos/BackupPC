@@ -17,7 +17,10 @@
 #   - bash 4.x+
 #   - flock (util-linux)
 #   - logger (util-linux)
+#   - realpath (coreutils)
+#   - mktemp (coreutils)
 #   - incus (for container operations)
+#   - pacman (for container package captures)
 #   - sudo access to tarCreate/tarRestore/backuppc-staging-cleanup
 #
 # File locations:
@@ -388,6 +391,106 @@ ensure_staging_dir() {
 }
 
 # -----------------------------------------------------------------------------
+# BIND MOUNT VERIFICATION AND CREATION
+# -----------------------------------------------------------------------------
+# This function ensures DEST is bind-mounted from exactly SOURCE.
+#
+# How it works:
+#   findmnt shows bind mounts to subdirectories as: device[/subpath]
+#   We construct this string from SOURCE and compare against DEST.
+#
+# What it catches:
+#   - DEST mounted from wrong directory
+#   - DEST mounted from wrong filesystem
+#   - DEST is a regular mount, not a bind mount (for subdirectory sources)
+#
+# Exit codes:
+#   0  - Bind mount correctly in place (existing or newly created)
+#   20 - Mount verification failed
+ensure_bind_mount() {
+  local src="${1:-}" dst="${2:-}"
+
+  # Validate parameters
+  if [[ -z "$src" || -z "$dst" ]]; then
+    fail 2 "ensure_bind_mount: requires <src_path> <dest_path>"
+  fi
+
+  # Create directories if needed
+  if ! mkdir -p -- "$src" "$dst"; then
+    fail 3 "Failed to create directories: $src and/or $dst"
+  fi
+
+  # Resolve symlinks for consistent comparison
+  local src_resolved="" dst_resolved=""
+  src_resolved=$(realpath "$src" 2>/dev/null) || true
+  dst_resolved=$(realpath "$dst" 2>/dev/null) || true
+
+  if [[ -z "$src_resolved" || ! -d "$src_resolved" ]]; then
+    fail 20 "Source not accessible: $src"
+  fi
+
+  if [[ -z "$dst_resolved" || ! -d "$dst_resolved" ]]; then
+    fail 20 "Destination not accessible: $dst"
+  fi
+
+  # Check if DEST is currently mounted
+  local actual=""
+  actual=$(findmnt -n -o SOURCE --mountpoint "$dst_resolved" 2>/dev/null) || true
+
+  if [[ -z "$actual" ]]; then
+    # Not mounted — create the bind mount
+    log "Creating bind mount: $src -> $dst"
+    if ! sudo /usr/bin/mount --bind "$src" "$dst"; then
+      fail 20 "Failed to create bind mount: $src -> $dst"
+    fi
+    log "Bind mount created successfully"
+    return 0
+  fi
+
+  # DEST is mounted — verify it's from exactly SOURCE
+  # Walk up SOURCE to find its actual mount point
+  local path="$src_resolved"
+  local src_device="" src_mountpoint=""
+  while [[ -n "$path" ]]; do
+    src_device=$(findmnt -n -o SOURCE --mountpoint "$path" 2>/dev/null) || true
+    if [[ -n "$src_device" ]]; then
+      src_mountpoint="$path"
+      break
+    fi
+    path="${path%/*}"
+  done
+
+  if [[ -z "$src_device" ]]; then
+    error "Could not determine mount point for source: $src"
+    error "Is the underlying filesystem mounted?"
+    fail 20 "Failed to verify bind mount: $src -> $dst"
+  fi
+
+  # Calculate relative path and build expected SOURCE string
+  local relative="${src_resolved#$src_mountpoint}"
+  local expected=""
+  if [[ -n "$relative" ]]; then
+    expected="${src_device}[${relative}]"
+  else
+    expected="$src_device"
+  fi
+
+  # Compare
+  if [[ "$actual" == "$expected" ]]; then
+    log "Bind mount already present: $src -> $dst"
+    return 0
+  fi
+
+  # Mismatch — report details and fail
+  error "$dst is already a mountpoint, but not our expected bind mount."
+  error "expected source: $expected"
+  error "actual source:   $actual"
+  error "findmnt output:"
+  error "  $(findmnt -o SOURCE,TARGET,FSTYPE,OPTIONS --target "$dst_resolved" 2>/dev/null || echo 'n/a')"
+  fail 20 "Wrong source mounted to $dst"
+}
+
+# -----------------------------------------------------------------------------
 # Container operations (Incus)
 # -----------------------------------------------------------------------------
 # Functions for interacting with Incus containers during backup operations.
@@ -455,6 +558,49 @@ wait_container_ready() {
     done
 
     fail 5 "Timeout waiting for container $container (${timeout}s)"
+}
+
+# Capture container package lists into a package list directory
+# Usage: capture_container_package_lists <container> <dest_dir>
+#
+# Note: Currently, only distributions using pacman as package manager are supported
+capture_container_package_lists() {
+    local container="$1"
+    local dest_dir="$2"
+    local capture_errors=""
+    local rc=0
+
+    if [[ -z "$container" || -z "$dest_dir" ]]; then
+        fail 2 "capture_container_package_lists: requires <container> <dest_dir>"
+    fi
+
+    # Ensure destination exists
+    ensure_staging_dir "$dest_dir"
+
+    log "Capturing package lists for container $container"
+
+    capture_errors=$(mktemp) || fail 5 "Failed to create temp file"
+    register_cleanup "rm -f '$capture_errors'"
+
+    incus exec "$container" -- pacman -Qqen \
+        > "$dest_dir/pkglist-repo.txt" \
+        2> "$capture_errors" \
+        || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        incus exec "$container" -- pacman -Qqem \
+            > "$dest_dir/pkglist-aur.txt" \
+            || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            log "No packages outside the official repositories were found (no AUR packages installed)"
+        fi
+        incus exec "$container" -- pacman -Qe   > "${dest_dir}/pkg-versions.txt"
+    else
+        warn "Failed to query packages from container '$container' (rc=$rc):"
+        while IFS= read -r line; do
+            warn "  $line"
+        done < "$capture_errors"
+        return "$rc"
+    fi
 }
 
 # require_command: Ensure command is available in container
