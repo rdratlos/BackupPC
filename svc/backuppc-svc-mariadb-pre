@@ -168,7 +168,7 @@ extract_config() {
     fi
 
     # Clean old extracted folder before extracting (robust against non-writable dirs)
-    backuppc-staging-cleanup "$CONFIG_DIR"
+    sudo backuppc-staging-cleanup "$CONFIG_DIR"
     # Use staging extract helper
     backuppc-staging-extract "$APP_CT" "$CONFIG_DIR" "${paths_to_extract[@]}" \
         || fail 5 "Failed to extract container configuration"
@@ -740,7 +740,7 @@ extract_binlog_archives() {
     local delete_ok="${3:-1}"   # default: delete after successful extraction
 
     # Clean old extracted folder before extracting (robust against non-writable dirs)
-    backuppc-staging-cleanup "${staging_dir}"
+    sudo backuppc-staging-cleanup "${staging_dir}"
 
     extract_container_dir "$APP_CT" "${src_dir}" "${staging_dir}"
 
