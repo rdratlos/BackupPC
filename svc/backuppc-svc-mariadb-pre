@@ -65,8 +65,8 @@ enable_strict_traps
 readonly APP_CT="mariadb"
 
 # MySQL user and group in MariaDB container
-CT_MYSQL_USER="mysql"
-CT_MYSQL_GROUP="mysql"
+readonly CT_MYSQL_USER="mysql"
+readonly CT_MYSQL_GROUP="mysql"
 
 # MySQL credentials file (--defaults-file format)
 readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
@@ -75,15 +75,19 @@ readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
 readonly STAGING_DIR="/export/mariadb/backuppc/server"
 
 # Service bind-mount configuration
-SERVICE_NAME="mariadb"
-VIEW_ROOT="/srv/backuppc/services"
-VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
+readonly SERVICE_NAME="mariadb"
+readonly VIEW_ROOT="/srv/backuppc/services"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
 
 # Subdirectories
 readonly CONFIG_DIR="${STAGING_DIR}/config"
 readonly DB_DIR="${STAGING_DIR}/db"
 readonly BINLOG_DIR="${DB_DIR}/binlogs"
 readonly META_DIR="${STAGING_DIR}/meta"
+
+# Subdirectories (container) relative to binary logs dir
+readonly CT_DB_FOLDER="db"
+readonly CT_BINLOG_ARCHIVE_FOLDER="binlogs"
 
 # Paths to extract from container
 readonly -a EXTRACT_PATHS=(
@@ -138,7 +142,6 @@ prepare_staging() {
     # Create directory structure
     ensure_staging_dir "$CONFIG_DIR"
     ensure_staging_dir "$DB_DIR"
-    ensure_staging_dir "$BINLOG_DIR"
     ensure_staging_dir "$META_DIR"
 
     log "Staging directories ready"
@@ -484,10 +487,10 @@ capture_metadata() {
     log "Metadata capture complete: $meta_file"
 }
 
-# Flush and archive binary logs
-process_binlogs() {
-    PHASE="process_binlogs"
-    log "Processing binary logs"
+# Get binary logs directory
+get_binlogs_dir() {
+    PHASE="check_binlogs"
+    log "Preparing binary logs processing"
 
     local binlog_errors
     binlog_errors=$(mktemp) || fail 5 "Failed to create temp file"
@@ -509,7 +512,7 @@ process_binlogs() {
 
     if [[ "$binlog_enabled" != "1" ]]; then
         log "Binary logging not enabled, skipping binlog processing"
-        return 0
+        return 3
     fi
 
     # Get binlog directory (container path)
@@ -526,15 +529,52 @@ process_binlogs() {
         fail 5 "Cannot determine binlog location"
     fi
 
+    # Normalize output
+    binlog_basename=${binlog_basename//$'\r'/}
+    binlog_basename=${binlog_basename//$'\n'/}
+
+    if [[ -z "$binlog_basename" ]]; then
+        info "Binary logging disabled (empty @@log_bin_basename); skipping binlog processing."
+        return 3
+    fi
+
+    # Resolve relative paths against datadir
+    if [[ "$binlog_basename" != /* ]]; then
+        local datadir=""
+        datadir=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e "SELECT @@datadir;") || {
+            fail 5 "Cannot read @@datadir to resolve relative @@log_bin_basename='$binlog_basename'"
+        }
+        datadir=${datadir%/}
+        binlog_basename="$datadir/$binlog_basename"
+    fi
+
     local binlog_dir
-    binlog_dir=$(dirname "$binlog_basename")
+    binlog_dir=${binlog_basename%/*}
+    if [[ -z "$binlog_dir" ]]; then
+        fail 5 "Could not derive directory from @@log_bin_basename='$binlog_basename'"
+    fi
 
     log "Binlog directory (container): $binlog_dir"
 
+    printf '%s\n' "$binlog_dir"
+    return 0
+}
+
+# Flush and archive binary logs
+process_binlogs() {
+    PHASE="process_binlogs"
+    log "Processing binary logs"
+
+    local binlog_dir="$1"
+
+    local binlog_errors
+    binlog_errors=$(mktemp) || fail 5 "Failed to create temp file"
+    register_cleanup "rm -f '$binlog_errors'"
+
     # Container paths
     local container_meta_dir="${binlog_dir}/backup-meta"
-    local container_staging_dir="${binlog_dir}/db"
-    local container_staging_binlogs="${container_staging_dir}/binlogs"
+    local container_staging_dir="${binlog_dir}/${CT_DB_FOLDER}"
+    local container_staging_binlogs="${container_staging_dir}/${CT_BINLOG_ARCHIVE_FOLDER}"
 
     # Ensure directories exist in container (owned by mysql)
     incus exec "$APP_CT" -- mkdir -p "${container_meta_dir}" "${container_staging_binlogs}"
@@ -685,6 +725,32 @@ process_binlogs() {
     incus exec "$APP_CT" -- chown -R "${CT_MYSQL_USER}:${CT_MYSQL_GROUP}" "${container_meta_dir}" "${container_staging_dir}"
 
     log "Binlog processing complete"
+
+    return $rc
+}
+
+# Move binary logs archives to staging dir
+extract_binlog_archives() {
+    PHASE="extract_binlog_archives"
+    log "Extracting binary log archives"
+
+    local container_staging_dir="$1/${CT_DB_FOLDER}"
+    local src_dir="${container_staging_dir}/${CT_BINLOG_ARCHIVE_FOLDER}"
+    local staging_dir="${BINLOG_DIR}"
+    local delete_ok="${3:-1}"   # default: delete after successful extraction
+
+    # Clean old extracted folder before extracting (robust against non-writable dirs)
+    backuppc-staging-cleanup "${staging_dir}"
+
+    extract_container_dir "$APP_CT" "${src_dir}" "${staging_dir}"
+
+    if (( delete_ok )); then
+        incus exec "$APP_CT" -- rm -rf "${container_staging_dir}"
+    else
+        log "Keeping binlog archive directory (delete suppressed): $src_dir"
+    fi
+
+    log "Binlog extraction complete"
 }
 
 # Generate summary report
@@ -737,6 +803,11 @@ main() {
     log "==== ${SCRIPT_NAME} started ===="
     timer_start "total"
 
+    # Container staging subdirectories
+    local container_binlogs_dir
+    local binlogs_status=0
+    local delete_ok=1
+
     # Acquire exclusive lock
     acquire_lock
 
@@ -783,7 +854,16 @@ main() {
     capture_metadata
 
     # Process binary logs
-    process_binlogs
+    if container_binlogs_dir=$(get_binlogs_dir); then
+        process_binlogs "$container_binlogs_dir" || binlogs_status=$?
+        (( binlogs_status != 0 )) && delete_ok=0
+        extract_binlog_archives "$container_binlogs_dir" "${BINLOG_DIR}" "$delete_ok"
+    else
+        case $? in
+            3) : ;;   # disabled: already logged, do nothing
+            *) fail 5 "Cannot determine binlog location" ;;
+        esac
+    fi
 
     # Capture package lists
     PHASE="package_list_dump"
