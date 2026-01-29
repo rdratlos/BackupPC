@@ -43,10 +43,15 @@ readonly SCRIPT_NAME="${0##*/}"
 readonly MIN_DEPTH=2  # Minimum depth below staging root (e.g., /root/service)
 
 # -----------------------------------------------------------------------------
-# Logging (minimal, suitable for sudo context)
+# Logging
 # -----------------------------------------------------------------------------
-log()  { echo "[${SCRIPT_NAME}] $*"; }
-err()  { echo "[${SCRIPT_NAME}] ERROR: $*" >&2; }
+_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SCRIPT_NAME}: $*" >&2
+}
+
+log() { _log "[INFO]  $*"; }
+err() { _log "[ERROR] $*"; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && _log "[DEBUG] $*"; }
 die()  { err "$2"; exit "$1"; }
 
 # -----------------------------------------------------------------------------

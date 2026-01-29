@@ -70,9 +70,10 @@ _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SCRIPT_NAME}: $*" >&2
 }
 
-log() { _log "INFO: $*"; }
-error() { _log "ERROR: $*"; }
-debug() { [[ "${DEBUG:-0}" == "1" ]] && _log "DEBUG: $*"; }
+log() { _log "[INFO]  $*"; }
+error() { _log "[ERROR] $*"; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && _log "[DEBUG] $*"; }
+die()  { error "$2"; exit "$1"; }
 
 # -----------------------------------------------------------------------------
 # Validation functions
@@ -376,8 +377,7 @@ main() {
     done
 
     if [[ $failed -gt 0 ]]; then
-        error "Failed to extract $failed path(s)"
-        exit 5
+        die 5 "Failed to extract $failed path(s)"
     fi
 
     log "Extraction complete: ${#paths[@]} path(s) to $staging_dir"
