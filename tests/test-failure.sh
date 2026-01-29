@@ -8,6 +8,9 @@
 #   ./test-failure.sh fail        - Explicit fail() call
 #   ./test-failure.sh err         - Unexpected command error (ERR trap)
 #   ./test-failure.sh cleanup     - Cleanup actions on failure
+#   ./test-failure.sh phases      - Phase tracking through execution
+#   ./test-failure.sh typo        - Typo in function call (simulates info vs log)
+#   ./test-failure.sh func-err    - Error inside a function (tests errtrace)
 
 source "$(dirname "$0")/../lib/backuppc/common.sh"
 enable_strict_traps
@@ -22,6 +25,30 @@ cleanup_temp() {
 cleanup_state() {
     echo "  → cleanup_state: would restore service state"
     echo "    (FAILED=$FAILED, checking if rollback needed)"
+}
+
+# Function that contains an error (for func-err test)
+function_with_error() {
+    PHASE="inside_function"
+    log "Inside function_with_error"
+    
+    # This will fail
+    false
+    
+    # Should not reach here
+    log "ERROR: This line should never execute"
+}
+
+# Function that contains a typo (for typo test)
+function_with_typo() {
+    PHASE="inside_function"
+    log "Inside function_with_typo"
+    
+    # Typo: "info" instead of "log" - info is not defined, will fail
+    info "This is a typo - should be log not info"
+    
+    # Should not reach here
+    log "ERROR: This line should never execute"
 }
 
 echo "=== Failure handling test: $TEST_CASE ==="
@@ -107,9 +134,53 @@ case "$TEST_CASE" in
         done
         ;;
 
+    typo)
+        echo "--- Testing typo in function name (info vs log) ---"
+        echo "This simulates accidentally typing 'info' instead of 'log'"
+        echo ""
+        register_cleanup "cleanup_temp"
+        register_cleanup "cleanup_state"
+
+        PHASE="initialization"
+        log "Starting typo test"
+
+        PHASE="calling_function"
+        log "Calling function that contains a typo..."
+        function_with_typo
+
+        # Should not reach here
+        echo "ERROR: This line should never execute"
+        ;;
+
+    func-err)
+        echo "--- Testing error inside a function (errtrace) ---"
+        echo "This verifies ERR trap fires inside functions (set -o errtrace)"
+        echo ""
+        register_cleanup "cleanup_temp"
+        register_cleanup "cleanup_state"
+
+        PHASE="initialization"
+        log "Starting function error test"
+
+        PHASE="calling_function"
+        log "Calling function that will fail internally..."
+        function_with_error
+
+        # Should not reach here
+        echo "ERROR: This line should never execute"
+        ;;
+
     *)
         echo "Unknown test case: $TEST_CASE"
-        echo "Valid options: success, fail, err, cleanup, phases"
+        echo ""
+        echo "Valid options:"
+        echo "  success   - Normal successful execution"
+        echo "  fail      - Explicit fail() call"
+        echo "  err       - Unexpected command error (ERR trap)"
+        echo "  cleanup   - Cleanup actions on failure"
+        echo "  phases    - Phase tracking through execution"
+        echo "  typo      - Typo in function call (info vs log)"
+        echo "  func-err  - Error inside a function (tests errtrace)"
         exit 1
         ;;
 esac

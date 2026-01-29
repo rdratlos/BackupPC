@@ -35,6 +35,7 @@
 set -o errexit      # Exit on error
 set -o nounset      # Error on unset variables
 set -o pipefail     # Pipeline fails on first error
+set -o errtrace     # ERR trap inherited by functions/subshells
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -91,11 +92,8 @@ _log() {
         echo "$formatted" >> "$LOG_FILE" 2>/dev/null || true
     fi
 
-    # Console output
-    case "$level" in
-        ERROR|WARN) echo "$formatted" >&2 ;;
-        *)          echo "$formatted" ;;
-    esac
+    # Console output (all to stderr)
+    echo "$formatted" >&2
 }
 
 log()   { _log INFO  "$@"; }
@@ -162,7 +160,7 @@ die() {
 # -----------------------------------------------------------------------------
 # Trap handlers
 # -----------------------------------------------------------------------------
-# on_err: ERR trap handler - captures unexpected errors
+# on_err: ERR trap handler - captures unexpected errors and exits
 # Triggered by set -o errexit when a command fails.
 #
 # Note: To enable, scripts must call: trap 'on_err' ERR
@@ -171,7 +169,7 @@ die() {
 on_err() {
     local rc=$?
 
-    # Capture failure details
+    # Capture failure details (only first failure)
     if [[ "$FAILED" -eq 0 ]]; then
         FAILED=1
         FAIL_RC="$rc"
@@ -180,19 +178,19 @@ on_err() {
         FAIL_CMD="${BASH_COMMAND:-unknown}"
         FAIL_MSG="command failed: ${FAIL_CMD}"
         error "Unexpected error: phase=${FAIL_PHASE} rc=${rc} line=${FAIL_LINE} cmd=${FAIL_CMD}"
-    else
-        # Additional error during cleanup/exit - log but don't override original
-        warn "Additional error: phase=${PHASE} rc=${rc} line=${BASH_LINENO[0]:-?} cmd=${BASH_COMMAND:-?}"
     fi
 
-    return "$rc"
+    # Exit immediately - cleanup will run via EXIT trap
+    # Note: We exit with the error code, EXIT trap will handle reporting
+    exit "$rc"
 }
 
 # on_exit: EXIT trap handler - runs cleanup and reports final status
 # This is the main exit handler that:
-#   1. Runs registered cleanup actions
-#   2. Reports success/failure with context
-#   3. Exits with appropriate code
+#   1. Disables ERR trap (cleanup errors shouldn't abort remaining cleanup)
+#   2. Runs registered cleanup actions
+#   3. Reports success/failure with context
+#   4. Exits with appropriate code
 #
 # Note: Automatically installed by enable_strict_traps or can be
 #       manually set with: trap 'on_exit' EXIT
@@ -200,9 +198,13 @@ on_err() {
 on_exit() {
     local rc=$?
 
+    # Disable ERR trap during cleanup - we don't want cleanup errors
+    # to trigger on_err (which would call exit and skip remaining cleanup)
+    trap - ERR
+
     # If we're exiting due to a failure, use the captured code
     # Otherwise use the actual exit code
-    local final_rc="${FAIL_RC:-$rc}"
+    local final_rc="$rc"
     if [[ "$FAILED" -ne 0 ]]; then
         final_rc="$FAIL_RC"
     fi
@@ -498,8 +500,12 @@ ensure_bind_mount() {
 # extract_container_path: Extract path from container preserving ownership
 # Usage: extract_container_path <container> <source_path> <dest_dir>
 #
+# Extracts a path relative to container root (/). The source path structure
+# is preserved in the destination.
+#
 # Example:
-#   extract_container_path ct-nextcloud etc/nextcloud /srv/staging/nextcloud/etc
+#   extract_container_path ct-nextcloud etc/nextcloud /srv/staging/nextcloud
+#   # Results in: /srv/staging/nextcloud/etc/nextcloud/...
 #
 # Note: source_path is relative to container root (no leading /)
 extract_container_path() {
@@ -520,6 +526,45 @@ extract_container_path() {
     incus exec "$container" -- tar cf - -C / "$src_path" 2>/dev/null \
         | sudo "${BACKUPPC_SBIN_DIR}/tarRestore" -C "$dest_dir" \
         || fail 4 "Failed to extract ${container}:/${src_path}"
+}
+
+# extract_container_dir: Extract directory contents from container
+# Usage: extract_container_dir <container> <source_dir> <dest_dir>
+#
+# Extracts the CONTENTS of a directory (not the directory itself) to the
+# destination. Useful for service-specific staging paths where you don't
+# want the source directory structure replicated.
+#
+# Example:
+#   extract_container_dir ct-mariadb /var/lib/mysql/db/binlogs /export/mariadb/backuppc/server/db/binlogs
+#   # Results in: /export/mariadb/backuppc/server/db/binlogs/<contents of binlogs>
+#
+# Contrast with extract_container_path:
+#   extract_container_path ct-mariadb var/lib/mysql/db/binlogs /export/mariadb
+#   # Results in: /export/mariadb/var/lib/mysql/db/binlogs/<contents>
+#
+extract_container_dir() {
+    local container="$1"
+    local src_dir="$2"
+    local dest_dir="$3"
+
+    if [[ -z "$container" || -z "$src_dir" || -z "$dest_dir" ]]; then
+        fail 2 "extract_container_dir: requires <container> <src_dir> <dest_dir>"
+    fi
+
+    # Normalize source: ensure it has a leading slash for clarity in logs
+    [[ "$src_dir" != /* ]] && src_dir="/${src_dir}"
+
+    # Ensure destination exists
+    ensure_staging_dir "$dest_dir"
+
+    log "Extracting ${container}:${src_dir}/* → ${dest_dir}/"
+
+    # Stream tar from container using src_dir as base, extracting "."
+    # This extracts only the contents, not the directory itself
+    incus exec "$container" -- tar cf - -C "$src_dir" . 2>/dev/null \
+        | sudo "${BACKUPPC_SBIN_DIR}/tarRestore" -C "$dest_dir" \
+        || fail 4 "Failed to extract ${container}:${src_dir}"
 }
 
 # container_exists: Check if container exists
