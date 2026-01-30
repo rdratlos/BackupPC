@@ -3,99 +3,318 @@
 # Test script for /usr/local/lib/backuppc/common.sh
 # sudo -u backuppc tests/test-common.sh
 # =============================================================================
+#
+# Tests core functionality that doesn't require containers or special privileges.
+# For container and bind mount tests, see test-integration.sh
+#
+# Usage:
+#   ./test-common.sh          # Run all tests
+#   ./test-common.sh quick    # Skip slow tests (timers)
 
 # Can override SCRIPT_NAME before sourcing if desired
 # SCRIPT_NAME="my-custom-name"
 
 source "$(dirname "$0")/../lib/backuppc/common.sh"
-u=$(id -un)
 
-echo "=== common.sh test suite ==="
-echo ""
+QUICK_MODE="${1:-}"
+TEST_COUNT=0
+PASS_COUNT=0
+
+# Test helper functions (output to stderr since log functions use stderr)
+test_start() {
+    ((TEST_COUNT++)) || true
+    echo "--- Test $TEST_COUNT: $1 ---" >&2
+}
+
+test_pass() {
+    ((PASS_COUNT++)) || true
+    echo "✓ $1" >&2
+}
+
+test_skip() {
+    echo "⊘ SKIPPED: $1" >&2
+}
+
+echo "=== common.sh test suite ===" >&2
+echo "" >&2
 
 # Test 1: Script identification
-echo "--- Test 1: Script identification ---"
-echo "SCRIPT_NAME: $SCRIPT_NAME"
-echo "LOG_FILE:    $LOG_FILE"
-echo "LOCK_FILE:   $LOCK_FILE"
-echo "LOG_TAG:     $LOG_TAG"
-echo "USER:        $u"
-echo ""
+test_start "Script identification"
+echo "SCRIPT_NAME: $SCRIPT_NAME" >&2
+echo "LOG_FILE:    $LOG_FILE" >&2
+echo "LOCK_FILE:   $LOCK_FILE" >&2
+echo "LOG_TAG:     $LOG_TAG" >&2
+[[ -n "$SCRIPT_NAME" ]] && test_pass "SCRIPT_NAME is set"
+[[ "$LOG_FILE" == *"LOG."* ]] && test_pass "LOG_FILE follows naming convention"
+[[ "$LOCK_FILE" == *"LOCK."* ]] && test_pass "LOCK_FILE follows naming convention"
+echo "" >&2
 
-# Test 2: Logging functions
-echo "--- Test 2: Logging functions ---"
+# Test 2: Logging functions (all go to stderr)
+test_start "Logging functions"
 log "This is an INFO message"
 warn "This is a WARN message"
 error "This is an ERROR message"
 DEBUG=1 debug "This is a DEBUG message (should appear)"
 DEBUG=0 debug "This DEBUG message should NOT appear"
-echo ""
+test_pass "Logging functions executed without error"
+echo "" >&2
 
 # Test 3: Validation helpers
-echo "--- Test 3: Validation helpers ---"
+test_start "Validation helpers"
 TEST_VAR="hello"
-require_var TEST_VAR && echo "✓ require_var passed for set variable"
+require_var TEST_VAR && test_pass "require_var passed for set variable"
+require_command bash && test_pass "require_command passed for 'bash'"
+require_command ls && test_pass "require_command passed for 'ls'"
 
-require_command bash && echo "✓ require_command passed for 'bash'"
+# Test require_file with a known file
+if [[ -f /etc/passwd ]]; then
+    require_file /etc/passwd && test_pass "require_file passed for /etc/passwd"
+fi
+
+# Test require_directory
+require_directory /tmp && test_pass "require_directory passed for /tmp"
+echo "" >&2
 
 # Test 4: Timer functions
-echo ""
-echo "--- Test 4: Timer functions ---"
-timer_start "test_operation"
-sleep 1
-timer_log "test_operation" "Test operation"
-echo ""
+test_start "Timer functions"
+if [[ "$QUICK_MODE" == "quick" ]]; then
+    test_skip "Timer test (quick mode)"
+else
+    timer_start "test_operation"
+    sleep 1
+    elapsed=$(timer_elapsed "test_operation")
+    [[ "$elapsed" -ge 1 ]] && test_pass "timer_elapsed returned $elapsed seconds"
+    timer_log "test_operation" "Test operation"
+fi
+echo "" >&2
 
 # Test 5: Utility functions
-echo "--- Test 5: Utility functions ---"
-echo "is_root: $(is_root && echo 'yes' || echo 'no')"
-echo "bytes_to_human 1536: $(bytes_to_human 1536)"
-echo "bytes_to_human 2097152: $(bytes_to_human 2097152)"
-echo "bytes_to_human 3221225472: $(bytes_to_human 3221225472)"
-echo ""
+test_start "Utility functions"
+echo "is_root: $(is_root && echo 'yes' || echo 'no')" >&2
+echo "is_backuppc_user: $(is_backuppc_user && echo 'yes' || echo 'no')" >&2
+
+result=$(bytes_to_human 512)
+[[ "$result" == "512B" ]] && test_pass "bytes_to_human 512 = $result"
+
+result=$(bytes_to_human 1536)
+[[ "$result" == "1K" ]] && test_pass "bytes_to_human 1536 = $result"
+
+result=$(bytes_to_human 2097152)
+[[ "$result" == "2M" ]] && test_pass "bytes_to_human 2097152 = $result"
+
+result=$(bytes_to_human 3221225472)
+[[ "$result" == "3G" ]] && test_pass "bytes_to_human 3221225472 = $result"
+echo "" >&2
 
 # Test 6: Phase tracking
-echo "--- Test 6: Phase tracking ---"
-echo "Initial PHASE: $PHASE"
+test_start "Phase tracking"
+echo "Initial PHASE: $PHASE" >&2
+[[ "$PHASE" == "init" ]] && test_pass "Initial PHASE is 'init'"
+
 PHASE="configuration"
-echo "After setting: $PHASE"
+[[ "$PHASE" == "configuration" ]] && test_pass "PHASE updated to 'configuration'"
+
 PHASE="extraction"
-echo "After update: $PHASE"
-echo ""
+[[ "$PHASE" == "extraction" ]] && test_pass "PHASE updated to 'extraction'"
+echo "" >&2
 
 # Test 7: Failure state (without actually failing)
-echo "--- Test 7: Failure state inspection ---"
-echo "FAILED: $FAILED (should be 0)"
-echo "FAIL_RC: $FAIL_RC (should be 0)"
-echo "FAIL_MSG: '${FAIL_MSG}' (should be empty)"
-echo ""
-echo "get_failure_summary (success case):"
-get_failure_summary
-echo ""
+test_start "Failure state inspection"
+echo "FAILED: $FAILED (should be 0)" >&2
+echo "FAIL_RC: $FAIL_RC (should be 0)" >&2
+echo "FAIL_MSG: '${FAIL_MSG}' (should be empty)" >&2
+[[ "$FAILED" -eq 0 ]] && test_pass "FAILED is 0"
+[[ "$FAIL_RC" -eq 0 ]] && test_pass "FAIL_RC is 0"
+[[ -z "$FAIL_MSG" ]] && test_pass "FAIL_MSG is empty"
+
+echo "" >&2
+echo "get_failure_summary (success case):" >&2
+summary=$(get_failure_summary)
+echo "$summary" >&2
+[[ "$summary" == "status=success" ]] && test_pass "get_failure_summary returns success"
+echo "" >&2
 
 # Test 8: Cleanup registration
-echo "--- Test 8: Cleanup registration ---"
-register_cleanup "echo '  → Cleanup action 1 executed'"
-register_cleanup "echo '  → Cleanup action 2 executed'"
-echo "Registered 2 cleanup actions (will execute on exit via on_exit trap)"
-echo ""
+test_start "Cleanup registration"
+initial_count=${#_CLEANUP_ACTIONS[@]}
+register_cleanup "echo '  → Test cleanup action 1' >&2"
+register_cleanup "echo '  → Test cleanup action 2' >&2"
+new_count=${#_CLEANUP_ACTIONS[@]}
+[[ $((new_count - initial_count)) -eq 2 ]] && test_pass "Registered 2 cleanup actions"
+echo "Total cleanup actions registered: $new_count" >&2
+echo "" >&2
 
 # Test 9: Lock management
-echo "--- Test 9: Lock management ---"
+test_start "Lock management"
 if [[ -d "$BACKUPPC_LOG_DIR" && -w "$BACKUPPC_LOG_DIR" ]]; then
-    acquire_lock "test-lock"
-    echo "Lock file created: ${BACKUPPC_LOG_DIR}/LOCK.test-lock"
-    release_lock
-    echo "Lock released"
+    acquire_lock "test-lock-$$"
+    test_pass "Lock acquired"
+    # Note: release_lock is registered as cleanup action, will run on exit
+    # Don't call release_lock here - it confuses FD handling
+    rm -f "${BACKUPPC_LOG_DIR}/LOCK.test-lock-$$" 2>/dev/null || true
 else
-    echo "Skipping lock test (log dir not available)"
+    test_skip "Lock test (log dir not available: $BACKUPPC_LOG_DIR)"
 fi
-echo ""
+echo "" >&2
 
-# Test 10: Enable strict traps (for final exit handling)
-echo "--- Test 10: Strict traps ---"
+# Test 10: Staging directory functions
+test_start "Staging directory functions"
+TEST_STAGING="/tmp/test-staging-$$"
+ensure_staging_dir "$TEST_STAGING"
+[[ -d "$TEST_STAGING" ]] && test_pass "ensure_staging_dir created directory"
+
+ensure_staging_dir "$TEST_STAGING/subdir" 0750
+[[ -d "$TEST_STAGING/subdir" ]] && test_pass "ensure_staging_dir created subdirectory"
+
+# Cleanup test staging
+rm -rf "$TEST_STAGING"
+test_pass "Test staging cleaned up"
+echo "" >&2
+
+# Test 11: Configuration helpers
+test_start "Configuration helpers"
+TEST_CONFIG="/tmp/test-config-$$.conf"
+echo 'TEST_CONFIG_VAR="loaded"' > "$TEST_CONFIG"
+load_config "$TEST_CONFIG"
+[[ "${TEST_CONFIG_VAR:-}" == "loaded" ]] && test_pass "load_config sourced config file"
+rm -f "$TEST_CONFIG"
+
+# Test optional config (should not fail)
+load_config "/nonexistent/config.conf" false && test_pass "load_config handles missing optional config"
+echo "" >&2
+
+# Test 12: Bind mount functions (signature validation only)
+test_start "Bind mount functions (signature validation)"
+# We can't test actual mounting without root, but we can verify functions exist
+if declare -f ensure_bind_mount > /dev/null; then
+    test_pass "ensure_bind_mount function exists"
+else
+    echo "✗ ensure_bind_mount function not found" >&2
+fi
+
+if declare -f remove_bind_mount > /dev/null; then
+    test_pass "remove_bind_mount function exists"
+else
+    echo "✗ remove_bind_mount function not found" >&2
+fi
+echo "" >&2
+
+# Test 13: Container functions (existence check only)
+test_start "Container functions (signature validation)"
+for func in container_exists container_running wait_container_ready \
+            extract_container_path extract_container_dir \
+            capture_container_package_lists require_container_command; do
+    if declare -f "$func" > /dev/null; then
+        test_pass "$func function exists"
+    else
+        echo "✗ $func function not found" >&2
+    fi
+done
+echo "" >&2
+
+# Test 14: Post-script xferOK functions
+test_start "Post-script xferOK functions"
+
+# Test init_xfer_status with explicit values
+init_xfer_status "dump" "1"
+[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status sets XFER_OK=1 for success"
+
+init_xfer_status "dump" "0"
+[[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status sets XFER_OK=0 for failure"
+
+# Test should_preserve_staging
+XFER_OK=1
+FAILED=0
+if ! should_preserve_staging; then
+    test_pass "should_preserve_staging returns false on success"
+fi
+
+XFER_OK=0
+FAILED=0
+if should_preserve_staging; then
+    test_pass "should_preserve_staging returns true on xfer failure"
+fi
+
+XFER_OK=1
+FAILED=1
+if should_preserve_staging; then
+    test_pass "should_preserve_staging returns true on script failure"
+fi
+
+# Reset state
+XFER_OK=0
+FAILED=0
+echo "" >&2
+
+# Test 15: Meta directory functions
+test_start "Meta directory functions"
+TEST_META="/tmp/test-meta-$$"
+mkdir -p "$TEST_META"
+
+write_meta_xferok "$TEST_META"
+[[ -f "$TEST_META/xferOK" ]] && test_pass "write_meta_xferok creates xferOK file"
+[[ -f "$TEST_META/finished_at" ]] && test_pass "write_meta_xferok creates finished_at file"
+
+write_meta_status "$TEST_META" "ok"
+[[ "$(cat "$TEST_META/status")" == "ok" ]] && test_pass "write_meta_status writes 'ok'"
+
+write_meta_status "$TEST_META" "failed" "test error message"
+[[ "$(cat "$TEST_META/status")" == "failed" ]] && test_pass "write_meta_status writes 'failed'"
+[[ "$(cat "$TEST_META/error")" == "test error message" ]] && test_pass "write_meta_status writes error message"
+
+rm -rf "$TEST_META"
+echo "" >&2
+
+# Test 16: File/directory verification functions
+test_start "Artifact verification functions"
+
+# Test verify_file_exists
+TEST_FILE="/tmp/test-file-$$"
+echo "test content" > "$TEST_FILE"
+if verify_file_exists "$TEST_FILE" "test file"; then
+    test_pass "verify_file_exists succeeds for existing file"
+fi
+
+if ! verify_file_exists "/nonexistent/file" "missing file" 2>/dev/null; then
+    test_pass "verify_file_exists fails for missing file"
+fi
+rm -f "$TEST_FILE"
+
+# Test verify_directory_exists
+TEST_DIR="/tmp/test-dir-$$"
+mkdir -p "$TEST_DIR"
+if verify_directory_exists "$TEST_DIR" "test directory"; then
+    test_pass "verify_directory_exists succeeds for existing directory"
+fi
+
+if ! verify_directory_exists "/nonexistent/dir" "missing dir" 2>/dev/null; then
+    test_pass "verify_directory_exists fails for missing directory"
+fi
+rmdir "$TEST_DIR"
+
+# Test verify_file_checksum (without actual checksum file - should succeed)
+TEST_FILE="/tmp/test-checksum-$$"
+echo "test" > "$TEST_FILE"
+if verify_file_checksum "$TEST_FILE"; then
+    test_pass "verify_file_checksum succeeds when no checksum file exists"
+fi
+rm -f "$TEST_FILE"
+
+# Test function existence for zstd (can't test without zstd installed)
+if declare -f verify_zstd_file > /dev/null; then
+    test_pass "verify_zstd_file function exists"
+fi
+echo "" >&2
+
+# Test 17: Enable strict traps (for final exit handling)
+test_start "Strict traps"
 enable_strict_traps
-echo "Strict traps enabled - on_exit will run at script end"
-echo ""
+test_pass "Strict traps enabled - on_exit will run at script end"
+echo "" >&2
 
-echo "=== Test suite complete (on_exit trap will now fire) ==="
+# Summary
+echo "========================================" >&2
+echo "Test Results: $PASS_COUNT passed" >&2
+echo "========================================" >&2
+echo "" >&2
+echo "=== Test suite complete (on_exit trap will now fire) ===" >&2

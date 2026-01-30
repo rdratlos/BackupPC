@@ -346,7 +346,7 @@ _run_cleanup_actions() {
         # Run cleanup, capture errors but don't abort
         if ! eval "$action" 2>/dev/null; then
             warn "Cleanup action failed: $action"
-            ((cleanup_errors++)) || true
+            cleanup_errors=$((cleanup_errors + 1))
         fi
     done
 
@@ -492,6 +492,72 @@ ensure_bind_mount() {
   fail 20 "Wrong source mounted to $dst"
 }
 
+# remove_bind_mount: Unmount a bind mount destination
+# Usage: remove_bind_mount <dest_path>
+#
+# Unmounts DEST only if it is a direct mount point.
+# If DEST is accessible via parent mount, leave it alone (not our responsibility).
+# If mount is busy, logs warning and returns success (intentional for failure investigation).
+#
+# Design note: This function intentionally does NOT fail the script on errors.
+# Post-backup scripts should complete cleanup as much as possible, and a busy
+# mount may be intentional (e.g., for investigating a failed backup).
+#
+# Exit codes:
+#   0  - Always returns 0 (mount cleaned up, not a direct mount, busy, or error)
+remove_bind_mount() {
+    local dst="${1:-}"
+
+    if [[ -z "$dst" ]]; then
+        error "remove_bind_mount: requires <dest_path>"
+        return 0  # Don't fail the whole post-script for parameter error
+    fi
+
+    # Resolve symlinks for consistent handling
+    local dst_resolved=""
+    dst_resolved=$(realpath "$dst" 2>/dev/null) || true
+
+    if [[ -z "$dst_resolved" || ! -d "$dst_resolved" ]]; then
+        warn "Destination not accessible: $dst (already cleaned up?)"
+        return 0
+    fi
+
+    # Check if DEST is itself a mount point (--mountpoint requires exact match)
+    local actual=""
+    actual=$(findmnt -n -o SOURCE --mountpoint "$dst_resolved" 2>/dev/null) || true
+
+    if [[ -z "$actual" ]]; then
+        # Not a direct mount point — check if accessible via parent
+        local via_parent=""
+        via_parent=$(findmnt -n -o SOURCE --target "$dst_resolved" 2>/dev/null) || true
+
+        if [[ -n "$via_parent" ]]; then
+            log "$dst accessible via parent mount, not a direct mount point — skipping"
+        else
+            log "$dst is not mounted — nothing to unmount"
+        fi
+        return 0
+    fi
+
+    # DEST is a direct mount point — unmount it
+    log "Unmounting bind mount: $dst"
+
+    if ! sudo /usr/bin/umount "$dst"; then
+        warn "Cannot unmount $dst — mount is busy or in use"
+        warn "This may be intentional (failed backup investigation) or another process"
+        warn "findmnt output:"
+        warn "  $(findmnt -o SOURCE,TARGET,FSTYPE,OPTIONS --mountpoint "$dst_resolved" 2>/dev/null || echo 'n/a')"
+        warn "Open files (first 10):"
+        while IFS= read -r line; do
+            warn "  $line"
+        done < <(sudo lsof +f -- "$dst_resolved" 2>/dev/null | head -10 || echo 'n/a')
+        return 0
+    fi
+
+    log "Bind mount removed successfully: $dst"
+    return 0
+}
+
 # -----------------------------------------------------------------------------
 # Container operations (Incus)
 # -----------------------------------------------------------------------------
@@ -599,7 +665,7 @@ wait_container_ready() {
             fi
         fi
         sleep 1
-        ((elapsed++))
+        elapsed=$((elapsed + 1))
     done
 
     fail 5 "Timeout waiting for container $container (${timeout}s)"
@@ -782,6 +848,259 @@ bytes_to_human() {
     else
         echo "${bytes}B"
     fi
+}
+
+# =============================================================================
+# POST-SCRIPT SUPPORT
+# =============================================================================
+# Functions for BackupPC post-backup scripts (DumpPostUserCmd).
+# These handle xferOK status, meta recording, and artifact validation.
+
+# -----------------------------------------------------------------------------
+# xferOK status handling
+# -----------------------------------------------------------------------------
+# BackupPC passes xferOK (1=success, 0=failure) to post-scripts.
+# These functions provide standardized parsing and decision logic.
+
+# Global for post-script xferOK status (0=failure, 1=success)
+declare -g XFER_OK=0
+
+# init_xfer_status: Parse and normalize BackupPC's xferOK
+#
+# BackupPC may pass xferOK as:
+#   - Command line argument (preferred)
+#   - Environment variable (fallback)
+#   - Possibly quoted or empty
+#
+# Usage:
+#   init_xfer_status "$1" "$2"   # cmdType, xferOK from argv
+#   init_xfer_status             # Uses env vars cmdType/xferOK
+#
+# Sets global XFER_OK to 0 or 1
+init_xfer_status() {
+    local cmd_type_arg="${1:-${cmdType:-}}"
+    local xfer_ok_arg="${2:-${xferOK:-}}"
+
+    # Strip surrounding quotes (BackupPC may pass quoted values)
+    cmd_type_arg="${cmd_type_arg#[\"\']}"; cmd_type_arg="${cmd_type_arg%[\"\']}"
+    xfer_ok_arg="${xfer_ok_arg#[\"\']}"; xfer_ok_arg="${xfer_ok_arg%[\"\']}"
+
+    if [[ -z "$xfer_ok_arg" ]]; then
+        # xferOK not provided - decide based on cmdType presence
+        if [[ -z "$cmd_type_arg" ]]; then
+            warn "xferOK and cmdType not provided; assuming backup failure"
+            XFER_OK=0
+        else
+            log "xferOK not provided but cmdType='${cmd_type_arg}'; assuming backup success"
+            XFER_OK=1
+        fi
+        return 0
+    fi
+
+    case "$xfer_ok_arg" in
+        1) XFER_OK=1 ;;
+        0) XFER_OK=0 ;;
+        *)
+            error "Invalid xferOK value: '$xfer_ok_arg'; assuming backup failure"
+            XFER_OK=0
+            ;;
+    esac
+
+    debug "xferOK initialized: XFER_OK=$XFER_OK"
+}
+
+# should_preserve_staging: Check if staging should be preserved for investigation
+#
+# Returns 0 (true) if staging should be preserved:
+#   - Script failed (FAILED != 0)
+#   - BackupPC transfer failed (XFER_OK != 1)
+#
+# Returns 1 (false) if staging can be cleaned up (success case)
+#
+# Usage:
+#   if should_preserve_staging; then
+#       log "Preserving staging for investigation"
+#   else
+#       cleanup_staging "$STAGING_DIR"
+#   fi
+should_preserve_staging() {
+    [[ "$FAILED" -ne 0 ]] || [[ "$XFER_OK" -ne 1 ]]
+}
+
+# -----------------------------------------------------------------------------
+# Meta directory operations
+# -----------------------------------------------------------------------------
+# Post-scripts record status in a meta/ subdirectory for diagnostics
+# and for coordination with monitoring/alerting systems.
+
+# write_meta_xferok: Record BackupPC xferOK and completion timestamp
+#
+# Creates:
+#   <meta_dir>/xferOK      - The xferOK value (0 or 1)
+#   <meta_dir>/finished_at - ISO 8601 timestamp
+#
+# Usage: write_meta_xferok <meta_dir>
+write_meta_xferok() {
+    local meta_dir="$1"
+
+    if [[ -z "$meta_dir" ]]; then
+        warn "write_meta_xferok: meta_dir required"
+        return 0
+    fi
+
+    mkdir -p -- "$meta_dir" 2>/dev/null || true
+    printf '%s\n' "$XFER_OK" > "${meta_dir}/xferOK" 2>/dev/null || true
+    date -Is > "${meta_dir}/finished_at" 2>/dev/null || true
+}
+
+# write_meta_status: Record final status and optional error message
+#
+# Creates:
+#   <meta_dir>/status - "ok" or "failed"
+#   <meta_dir>/error  - Error message (cleared on success)
+#
+# Usage:
+#   write_meta_status <meta_dir> "ok"
+#   write_meta_status <meta_dir> "failed" "phase=dump rc=5 msg=timeout"
+write_meta_status() {
+    local meta_dir="$1"
+    local status="$2"
+    local err_msg="${3:-}"
+
+    if [[ -z "$meta_dir" || -z "$status" ]]; then
+        warn "write_meta_status: meta_dir and status required"
+        return 0
+    fi
+
+    mkdir -p -- "$meta_dir" 2>/dev/null || true
+    printf '%s\n' "$status" > "${meta_dir}/status" 2>/dev/null || true
+
+    if [[ "$status" == "ok" ]]; then
+        # Clear stale error on success
+        : > "${meta_dir}/error" 2>/dev/null || true
+    else
+        printf '%s\n' "$err_msg" > "${meta_dir}/error" 2>/dev/null || true
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Artifact validation helpers
+# -----------------------------------------------------------------------------
+# Post-scripts validate backup artifacts before declaring success.
+# These helpers provide consistent validation with good error messages.
+
+# verify_zstd_file: Verify zstd-compressed file exists and passes integrity test
+#
+# Checks:
+#   1. File exists
+#   2. File is non-empty
+#   3. zstd -t passes (decompression integrity)
+#
+# Usage: verify_zstd_file <file> [description]
+# Returns: 0 on success, 1 on failure (with error logged)
+verify_zstd_file() {
+    local file="$1"
+    local desc="${2:-$file}"
+
+    if [[ ! -f "$file" ]]; then
+        error "Missing artifact: $desc"
+        error "  Expected: $file"
+        return 1
+    fi
+
+    if [[ ! -s "$file" ]]; then
+        error "Empty artifact: $desc"
+        error "  File: $file"
+        return 1
+    fi
+
+    if ! zstd -t --quiet "$file" 2>/dev/null; then
+        error "Failed zstd integrity test: $desc"
+        error "  File: $file"
+        return 1
+    fi
+
+    log "Verified: $desc ($(stat -c%s "$file" | numfmt --to=iec-i)B)"
+    return 0
+}
+
+# verify_file_checksum: Verify file against its SHA256 checksum sidecar
+#
+# Expects <file>.sha256 in sha256sum format: "<hash>  <filename>"
+# If checksum file doesn't exist, logs warning but returns success.
+#
+# Usage: verify_file_checksum <file>
+# Returns: 0 on success or missing checksum, 1 on mismatch
+verify_file_checksum() {
+    local file="$1"
+    local checksum_file="${file}.sha256"
+
+    if [[ ! -f "$checksum_file" ]]; then
+        debug "No checksum file for: $file"
+        return 0
+    fi
+
+    local dir name
+    dir=$(dirname "$file")
+    name=$(basename "$file")
+
+    # Run sha256sum in the file's directory for correct relative path matching
+    if ! (cd "$dir" && sha256sum -c "${name}.sha256" --quiet 2>/dev/null); then
+        error "Checksum mismatch: $file"
+        error "  Checksum file: $checksum_file"
+        return 1
+    fi
+
+    debug "Checksum verified: $file"
+    return 0
+}
+
+# verify_directory_exists: Check directory exists and is non-empty
+#
+# Usage: verify_directory_exists <dir> [description]
+# Returns: 0 if exists (may warn if empty), 1 if missing
+verify_directory_exists() {
+    local dir="$1"
+    local desc="${2:-$dir}"
+
+    if [[ ! -d "$dir" ]]; then
+        error "Missing directory: $desc"
+        error "  Expected: $dir"
+        return 1
+    fi
+
+    # Check if directory has any contents
+    if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+        warn "Empty directory: $desc"
+    else
+        debug "Directory exists: $desc"
+    fi
+
+    return 0
+}
+
+# verify_file_exists: Check file exists and is readable
+#
+# Usage: verify_file_exists <file> [description]
+# Returns: 0 on success, 1 on failure
+verify_file_exists() {
+    local file="$1"
+    local desc="${2:-$file}"
+
+    if [[ ! -f "$file" ]]; then
+        error "Missing file: $desc"
+        error "  Expected: $file"
+        return 1
+    fi
+
+    if [[ ! -r "$file" ]]; then
+        error "File not readable: $desc"
+        error "  File: $file"
+        return 1
+    fi
+
+    debug "File exists: $desc"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
