@@ -547,10 +547,6 @@ remove_bind_mount() {
         warn "This may be intentional (failed backup investigation) or another process"
         warn "findmnt output:"
         warn "  $(findmnt -o SOURCE,TARGET,FSTYPE,OPTIONS --mountpoint "$dst_resolved" 2>/dev/null || echo 'n/a')"
-        warn "Open files (first 10):"
-        while IFS= read -r line; do
-            warn "  $line"
-        done < <(sudo lsof +f -- "$dst_resolved" 2>/dev/null | head -10 || echo 'n/a')
         return 0
     fi
 
@@ -640,8 +636,13 @@ extract_container_dir() {
 # Files are owned by the executing user (typically backuppc).
 # Use when original ownership is irrelevant (dumps, generated files, metadata).
 #
+# Contrast with extract_container_dir:
+#   extract_container_dir - preserves ownership (requires sudo tarRestore)
+#   copy_container_dir    - backuppc ownership (no sudo needed)
+#
 # Example:
-#   copy_container_dir ct-mariadb /var/lib/mysql/db/binlogs /staging/binlogs
+#   copy_container_dir ct-mariadb /tmp/dump /staging/dump
+#   # Results in: /staging/dump/<files owned by backuppc>
 #
 copy_container_dir() {
     local container="$1"
@@ -652,7 +653,7 @@ copy_container_dir() {
         fail 2 "copy_container_dir: requires <container> <src_dir> <dest_dir>"
     fi
 
-    # Normalize source
+    # Normalize source: ensure it has a leading slash for clarity in logs
     [[ "$src_dir" != /* ]] && src_dir="/${src_dir}"
 
     # Ensure destination exists
@@ -660,7 +661,8 @@ copy_container_dir() {
 
     log "Copying ${container}:${src_dir}/* → ${dest_dir}/ (backuppc ownership)"
 
-    # Stream tar from container, extract without sudo (--no-same-owner is default for non-root)
+    # Stream tar from container, extract without sudo
+    # --no-same-owner is default for non-root, files owned by executing user
     incus exec "$container" -- tar cf - -C "$src_dir" . 2>/dev/null \
         | tar xf - -C "$dest_dir" \
         || fail 4 "Failed to copy ${container}:${src_dir}"
@@ -898,48 +900,129 @@ bytes_to_human() {
 # Global for post-script xferOK status (0=failure, 1=success)
 declare -g XFER_OK=0
 
-# init_xfer_status: Parse and normalize BackupPC's xferOK
+# Valid BackupPC command types
+readonly -a VALID_CMD_TYPES=(
+    # Pre-backup commands
+    "DumpPreUserCmd"
+    "DumpPreShareCmd"
+    # Post-backup commands
+    "DumpPostUserCmd"
+    "DumpPostShareCmd"
+    # Restore commands
+    "RestorePreUserCmd"
+    "RestorePostUserCmd"
+    # Archive commands
+    "ArchivePreUserCmd"
+    "ArchivePostUserCmd"
+)
+
+# init_xfer_status: Parse and validate BackupPC's cmdType and xferOK
 #
-# BackupPC may pass xferOK as:
-#   - Command line argument (preferred)
-#   - Environment variable (fallback)
-#   - Possibly quoted or empty
+# BackupPC passes cmdType and xferOK to scripts:
+#   $Conf{DumpPostUserCmd} = '/path/to/script $cmdType $xferOK';
+#
+# This function:
+#   1. Validates cmdType matches the expected command type
+#   2. Validates xferOK is 0 or 1 (for post-commands)
+#   3. Sets global XFER_OK accordingly
 #
 # Usage:
-#   init_xfer_status "$1" "$2"   # cmdType, xferOK from argv
-#   init_xfer_status             # Uses env vars cmdType/xferOK
+#   init_xfer_status "DumpPostUserCmd" "$1" "$2"   # expected, cmdType, xferOK
+#   init_xfer_status "DumpPreUserCmd" "$1"         # expected, cmdType (no xferOK for pre)
 #
-# Sets global XFER_OK to 0 or 1
+# Parameters:
+#   $1 - Expected command type (e.g., "DumpPostUserCmd")
+#   $2 - Actual cmdType from BackupPC
+#   $3 - xferOK value (optional for pre-commands, required for post-commands)
+#
+# Returns:
+#   0 - Success, XFER_OK set appropriately
+#   1 - Validation failed, XFER_OK=0
+#
 init_xfer_status() {
-    local cmd_type_arg="${1:-${cmdType:-}}"
-    local xfer_ok_arg="${2:-${xferOK:-}}"
+    local expected_cmd="${1:-}"
+    local actual_cmd="${2:-}"
+    local xfer_ok_arg="${3:-}"
 
     # Strip surrounding quotes (BackupPC may pass quoted values)
-    cmd_type_arg="${cmd_type_arg#[\"\']}"; cmd_type_arg="${cmd_type_arg%[\"\']}"
+    actual_cmd="${actual_cmd#[\"\']}"; actual_cmd="${actual_cmd%[\"\']}"
     xfer_ok_arg="${xfer_ok_arg#[\"\']}"; xfer_ok_arg="${xfer_ok_arg%[\"\']}"
 
-    if [[ -z "$xfer_ok_arg" ]]; then
-        # xferOK not provided - decide based on cmdType presence
-        if [[ -z "$cmd_type_arg" ]]; then
-            warn "xferOK and cmdType not provided; assuming backup failure"
-            XFER_OK=0
-        else
-            log "xferOK not provided but cmdType='${cmd_type_arg}'; assuming backup success"
-            XFER_OK=1
+    # Validate expected command type is known
+    if [[ -z "$expected_cmd" ]]; then
+        error "init_xfer_status: expected command type not specified"
+        XFER_OK=0
+        return 1
+    fi
+
+    local valid_expected=0
+    local valid_type
+    for valid_type in "${VALID_CMD_TYPES[@]}"; do
+        if [[ "$expected_cmd" == "$valid_type" ]]; then
+            valid_expected=1
+            break
         fi
+    done
+
+    if [[ "$valid_expected" -eq 0 ]]; then
+        error "init_xfer_status: unknown expected command type '$expected_cmd'"
+        error "  Valid types: ${VALID_CMD_TYPES[*]}"
+        XFER_OK=0
+        return 1
+    fi
+
+    # Validate actual cmdType matches expected
+    if [[ -z "$actual_cmd" ]]; then
+        error "init_xfer_status: cmdType not provided; expected '$expected_cmd'"
+        XFER_OK=0
+        return 1
+    fi
+
+    if [[ "$actual_cmd" != "$expected_cmd" ]]; then
+        error "init_xfer_status: cmdType mismatch"
+        error "  Expected: $expected_cmd"
+        error "  Actual:   $actual_cmd"
+        XFER_OK=0
+        return 1
+    fi
+
+    # Determine if this is a pre or post command
+    local is_post_cmd=0
+    case "$expected_cmd" in
+        *Post*) is_post_cmd=1 ;;
+    esac
+
+    # For pre-commands, xferOK is not applicable
+    if [[ "$is_post_cmd" -eq 0 ]]; then
+        log "BackupPC $actual_cmd: pre-command (xferOK not applicable)"
+        XFER_OK=1  # Assume success for pre-commands
         return 0
     fi
 
+    # For post-commands, xferOK is required
+    if [[ -z "$xfer_ok_arg" ]]; then
+        error "init_xfer_status: xferOK not provided for post-command '$actual_cmd'"
+        XFER_OK=0
+        return 1
+    fi
+
     case "$xfer_ok_arg" in
-        1) XFER_OK=1 ;;
-        0) XFER_OK=0 ;;
-        *)
-            error "Invalid xferOK value: '$xfer_ok_arg'; assuming backup failure"
+        1)
+            XFER_OK=1
+            log "BackupPC $actual_cmd: xferOK=$XFER_OK (success)"
+            ;;
+        0)
             XFER_OK=0
+            warn "BackupPC $actual_cmd: xferOK=$XFER_OK (failure)"
+            ;;
+        *)
+            error "init_xfer_status: invalid xferOK value '$xfer_ok_arg'; expected 0 or 1"
+            XFER_OK=0
+            return 1
             ;;
     esac
 
-    debug "xferOK initialized: XFER_OK=$XFER_OK"
+    return 0
 }
 
 # should_preserve_staging: Check if staging should be preserved for investigation

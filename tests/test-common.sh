@@ -215,12 +215,50 @@ echo "" >&2
 # Test 14: Post-script xferOK functions
 test_start "Post-script xferOK functions"
 
-# Test init_xfer_status with explicit values
-init_xfer_status "dump" "1"
-[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status sets XFER_OK=1 for success"
+# Test init_xfer_status with valid post-command types
+init_xfer_status "DumpPostUserCmd" "DumpPostUserCmd" "1"
+[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status accepts DumpPostUserCmd with xferOK=1"
 
-init_xfer_status "dump" "0"
-[[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status sets XFER_OK=0 for failure"
+init_xfer_status "DumpPostUserCmd" "DumpPostUserCmd" "0"
+[[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status accepts DumpPostUserCmd with xferOK=0"
+
+init_xfer_status "RestorePostUserCmd" "RestorePostUserCmd" "1"
+[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status accepts RestorePostUserCmd"
+
+init_xfer_status "ArchivePostUserCmd" "ArchivePostUserCmd" "1"
+[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status accepts ArchivePostUserCmd"
+
+# Test pre-command types (no xferOK required)
+init_xfer_status "DumpPreUserCmd" "DumpPreUserCmd"
+[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status accepts DumpPreUserCmd (no xferOK)"
+
+init_xfer_status "DumpPreShareCmd" "DumpPreShareCmd"
+[[ "$XFER_OK" -eq 1 ]] && test_pass "init_xfer_status accepts DumpPreShareCmd (no xferOK)"
+
+# Test cmdType mismatch rejection
+if ! init_xfer_status "DumpPostUserCmd" "DumpPreUserCmd" "1" 2>/dev/null; then
+    [[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status rejects cmdType mismatch"
+fi
+
+# Test rejection of invalid expected command
+if ! init_xfer_status "InvalidCommand" "InvalidCommand" "1" 2>/dev/null; then
+    [[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status rejects invalid expected cmdType"
+fi
+
+# Test rejection of missing actual cmdType
+if ! init_xfer_status "DumpPostUserCmd" "" "1" 2>/dev/null; then
+    [[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status rejects empty actual cmdType"
+fi
+
+# Test rejection of missing xferOK for post-command
+if ! init_xfer_status "DumpPostUserCmd" "DumpPostUserCmd" "" 2>/dev/null; then
+    [[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status rejects missing xferOK for post-cmd"
+fi
+
+# Test rejection of invalid xferOK value
+if ! init_xfer_status "DumpPostUserCmd" "DumpPostUserCmd" "2" 2>/dev/null; then
+    [[ "$XFER_OK" -eq 0 ]] && test_pass "init_xfer_status rejects invalid xferOK value"
+fi
 
 # Test should_preserve_staging
 XFER_OK=1
