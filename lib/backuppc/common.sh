@@ -633,6 +633,39 @@ extract_container_dir() {
         || fail 4 "Failed to extract ${container}:${src_dir}"
 }
 
+# copy_container_dir: Copy directory contents from container (backuppc ownership)
+# Usage: copy_container_dir <container> <source_dir> <dest_dir>
+#
+# Similar to extract_container_dir but does NOT preserve ownership.
+# Files are owned by the executing user (typically backuppc).
+# Use when original ownership is irrelevant (dumps, generated files, metadata).
+#
+# Example:
+#   copy_container_dir ct-mariadb /var/lib/mysql/db/binlogs /staging/binlogs
+#
+copy_container_dir() {
+    local container="$1"
+    local src_dir="$2"
+    local dest_dir="$3"
+
+    if [[ -z "$container" || -z "$src_dir" || -z "$dest_dir" ]]; then
+        fail 2 "copy_container_dir: requires <container> <src_dir> <dest_dir>"
+    fi
+
+    # Normalize source
+    [[ "$src_dir" != /* ]] && src_dir="/${src_dir}"
+
+    # Ensure destination exists
+    ensure_staging_dir "$dest_dir"
+
+    log "Copying ${container}:${src_dir}/* → ${dest_dir}/ (backuppc ownership)"
+
+    # Stream tar from container, extract without sudo (--no-same-owner is default for non-root)
+    incus exec "$container" -- tar cf - -C "$src_dir" . 2>/dev/null \
+        | tar xf - -C "$dest_dir" \
+        || fail 4 "Failed to copy ${container}:${src_dir}"
+}
+
 # container_exists: Check if container exists
 container_exists() {
     local container="$1"
