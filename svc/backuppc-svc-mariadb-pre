@@ -721,7 +721,7 @@ process_binlogs() {
         fi
     fi
 
-    # Ensure meta and staing files in container are owned by mysql
+    # Ensure meta and staging files in container are owned by mysql
     incus exec "$APP_CT" -- chown -R "${CT_MYSQL_USER}:${CT_MYSQL_GROUP}" "${container_meta_dir}" "${container_staging_dir}"
 
     log "Binlog processing complete"
@@ -742,7 +742,7 @@ extract_binlog_archives() {
     # Clean old extracted folder before extracting (robust against non-writable dirs)
     sudo backuppc-staging-cleanup "${staging_dir}"
 
-    extract_container_dir "$APP_CT" "${src_dir}" "${staging_dir}"
+    copy_container_dir "$APP_CT" "${src_dir}" "${staging_dir}"
 
     if (( delete_ok )); then
         incus exec "$APP_CT" -- rm -rf "${container_staging_dir}"
@@ -775,7 +775,26 @@ generate_summary() {
     log "  Archived binlogs: ${binlog_count}"
 
     if [[ -d "$CONFIG_DIR" ]]; then
-        log "  Config files: $(find "$CONFIG_DIR" -type f 2>/dev/null | wc -l) files"
+        local file_list
+        local file_count=0
+        local restricted_dirs
+        local restricted_dir_count=0
+
+        file_list=$(find "$CONFIG_DIR" -type f 2>/dev/null || true)
+        restricted_dirs=$(find "$CONFIG_DIR" -type d ! -readable 2>/dev/null || true)
+
+        if [[ -n "$file_list" ]]; then
+            file_count=$(wc -l <<< "$file_list")
+        fi
+        if [[ -n "$restricted_dirs" ]]; then
+            restricted_dir_count=$(wc -l <<< "$restricted_dirs")
+        fi
+
+        if [[ $restricted_dir_count -gt 0 ]]; then
+            log "  Config files: ${file_count}+ (${restricted_dir_count} restricted dirs)"
+        else
+            log "  Config files: ${file_count}"
+        fi
     fi
 
     if [[ -f "${META_DIR}/instance-metadata.txt" ]]; then

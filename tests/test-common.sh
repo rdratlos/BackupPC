@@ -202,7 +202,7 @@ echo "" >&2
 # Test 13: Container functions (existence check only)
 test_start "Container functions (signature validation)"
 for func in container_exists container_running wait_container_ready \
-            extract_container_path extract_container_dir \
+            extract_container_path extract_container_dir copy_container_dir \
             capture_container_package_lists require_container_command; do
     if declare -f "$func" > /dev/null; then
         test_pass "$func function exists"
