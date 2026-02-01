@@ -49,7 +49,15 @@ echo "LOG_TAG:     $LOG_TAG" >&2
 [[ "$LOCK_FILE" == *"LOCK."* ]] && test_pass "LOCK_FILE follows naming convention"
 echo "" >&2
 
-# Test 2: Logging functions (all go to stderr)
+# Test 2: PATH environment setup
+test_start "PATH environment setup"
+[[ ":$PATH:" == *":/usr/local/sbin:"* ]] && test_pass "PATH contains /usr/local/sbin"
+[[ ":$PATH:" == *":/usr/local/bin:"* ]] && test_pass "PATH contains /usr/local/bin"
+[[ ":$PATH:" == *":/usr/sbin:"* ]] && test_pass "PATH contains /usr/sbin"
+[[ ":$PATH:" == *":/usr/bin:"* ]] && test_pass "PATH contains /usr/bin"
+echo "" >&2
+
+# Test 3: Logging functions (all go to stderr)
 test_start "Logging functions"
 log "This is an INFO message"
 warn "This is a WARN message"
@@ -59,7 +67,7 @@ DEBUG=0 debug "This DEBUG message should NOT appear"
 test_pass "Logging functions executed without error"
 echo "" >&2
 
-# Test 3: Validation helpers
+# Test 4: Validation helpers
 test_start "Validation helpers"
 TEST_VAR="hello"
 require_var TEST_VAR && test_pass "require_var passed for set variable"
@@ -75,7 +83,7 @@ fi
 require_directory /tmp && test_pass "require_directory passed for /tmp"
 echo "" >&2
 
-# Test 4: Timer functions
+# Test 5: Timer functions
 test_start "Timer functions"
 if [[ "$QUICK_MODE" == "quick" ]]; then
     test_skip "Timer test (quick mode)"
@@ -88,7 +96,7 @@ else
 fi
 echo "" >&2
 
-# Test 5: Utility functions
+# Test 6: Utility functions
 test_start "Utility functions"
 echo "is_root: $(is_root && echo 'yes' || echo 'no')" >&2
 echo "is_backuppc_user: $(is_backuppc_user && echo 'yes' || echo 'no')" >&2
@@ -106,7 +114,7 @@ result=$(bytes_to_human 3221225472)
 [[ "$result" == "3G" ]] && test_pass "bytes_to_human 3221225472 = $result"
 echo "" >&2
 
-# Test 6: Phase tracking
+# Test 7: Phase tracking
 test_start "Phase tracking"
 echo "Initial PHASE: $PHASE" >&2
 [[ "$PHASE" == "init" ]] && test_pass "Initial PHASE is 'init'"
@@ -118,7 +126,7 @@ PHASE="extraction"
 [[ "$PHASE" == "extraction" ]] && test_pass "PHASE updated to 'extraction'"
 echo "" >&2
 
-# Test 7: Failure state (without actually failing)
+# Test 8: Failure state (without actually failing)
 test_start "Failure state inspection"
 echo "FAILED: $FAILED (should be 0)" >&2
 echo "FAIL_RC: $FAIL_RC (should be 0)" >&2
@@ -134,7 +142,7 @@ echo "$summary" >&2
 [[ "$summary" == "status=success" ]] && test_pass "get_failure_summary returns success"
 echo "" >&2
 
-# Test 8: Cleanup registration
+# Test 9: Cleanup registration
 test_start "Cleanup registration"
 initial_count=${#_CLEANUP_ACTIONS[@]}
 register_cleanup "echo '  → Test cleanup action 1' >&2"
@@ -144,7 +152,7 @@ new_count=${#_CLEANUP_ACTIONS[@]}
 echo "Total cleanup actions registered: $new_count" >&2
 echo "" >&2
 
-# Test 9: Lock management
+# Test 10: Lock management
 test_start "Lock management"
 if [[ -d "$BACKUPPC_LOG_DIR" && -w "$BACKUPPC_LOG_DIR" ]]; then
     acquire_lock "test-lock-$$"
@@ -157,7 +165,7 @@ else
 fi
 echo "" >&2
 
-# Test 10: Staging directory functions
+# Test 11: Staging directory functions
 test_start "Staging directory functions"
 TEST_STAGING="/tmp/test-staging-$$"
 ensure_staging_dir "$TEST_STAGING"
@@ -171,7 +179,7 @@ rm -rf "$TEST_STAGING"
 test_pass "Test staging cleaned up"
 echo "" >&2
 
-# Test 11: Configuration helpers
+# Test 12: Configuration helpers
 test_start "Configuration helpers"
 TEST_CONFIG="/tmp/test-config-$$.conf"
 echo 'TEST_CONFIG_VAR="loaded"' > "$TEST_CONFIG"
@@ -183,7 +191,7 @@ rm -f "$TEST_CONFIG"
 load_config "/nonexistent/config.conf" false && test_pass "load_config handles missing optional config"
 echo "" >&2
 
-# Test 12: Bind mount functions (signature validation only)
+# Test 13: Bind mount functions (signature validation only)
 test_start "Bind mount functions (signature validation)"
 # We can't test actual mounting without root, but we can verify functions exist
 if declare -f ensure_bind_mount > /dev/null; then
@@ -199,7 +207,7 @@ else
 fi
 echo "" >&2
 
-# Test 13: Container functions (existence check only)
+# Test 14: Container functions (existence check only)
 test_start "Container functions (signature validation)"
 for func in container_exists container_running wait_container_ready \
             extract_container_path extract_container_dir copy_container_dir \
@@ -212,7 +220,7 @@ for func in container_exists container_running wait_container_ready \
 done
 echo "" >&2
 
-# Test 14: Post-script xferOK functions
+# Test 15: Post-script xferOK functions
 test_start "Post-script xferOK functions"
 
 # Test init_xfer_status with valid post-command types
@@ -284,7 +292,7 @@ XFER_OK=0
 FAILED=0
 echo "" >&2
 
-# Test 15: Meta directory functions
+# Test 16: Meta directory functions
 test_start "Meta directory functions"
 TEST_META="/tmp/test-meta-$$"
 mkdir -p "$TEST_META"
@@ -303,7 +311,7 @@ write_meta_status "$TEST_META" "failed" "test error message"
 rm -rf "$TEST_META"
 echo "" >&2
 
-# Test 16: File/directory verification functions
+# Test 17: File/directory verification functions
 test_start "Artifact verification functions"
 
 # Test verify_file_exists

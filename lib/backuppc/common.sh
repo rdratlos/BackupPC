@@ -17,11 +17,14 @@
 #   - bash 4.x+
 #   - flock (util-linux)
 #   - logger (util-linux)
+#   - findmnt (util-linux)
 #   - realpath (coreutils)
 #   - mktemp (coreutils)
+#   - zstd (for artifact validation)
+#   - sha256sum (coreutils)
 #   - incus (for container operations)
-#   - pacman (for container package captures)
-#   - sudo access to tarCreate/tarRestore/backuppc-staging-cleanup
+#   - pacman (for container package captures, Arch/Manjaro only)
+#   - sudo access to mount, umount, tarCreate, tarRestore, backuppc-staging-cleanup
 #
 # File locations:
 #   Logs:  /var/log/backuppc/LOG.${SCRIPT_NAME}
@@ -43,6 +46,25 @@ set -o errtrace     # ERR trap inherited by functions/subshells
 readonly BACKUPPC_LOG_DIR="/var/log/backuppc"
 readonly BACKUPPC_LIB_DIR="/usr/local/lib/backuppc"
 readonly BACKUPPC_SBIN_DIR="/usr/local/sbin"
+
+# -----------------------------------------------------------------------------
+# Environment setup
+# -----------------------------------------------------------------------------
+# BackupPC runs scripts with minimal PATH (often just /bin).
+# Ensure standard system paths are available for our tools.
+# We prepend to preserve any existing PATH entries.
+
+_BACKUPPC_REQUIRED_PATHS="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Only add paths not already present
+for _path in ${_BACKUPPC_REQUIRED_PATHS//:/ }; do
+    case ":${PATH}:" in
+        *":${_path}:"*) ;;  # Already in PATH
+        *) PATH="${_path}:${PATH}" ;;
+    esac
+done
+unset _path _BACKUPPC_REQUIRED_PATHS
+export PATH
 
 # Script identification (caller may override SCRIPT_NAME before sourcing)
 : "${SCRIPT_NAME:=$(basename "${BASH_SOURCE[-1]}" 2>/dev/null || basename "$0")}"
