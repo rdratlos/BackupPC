@@ -50,10 +50,11 @@ readonly BACKUPPC_SBIN_DIR="/usr/local/sbin"
 # -----------------------------------------------------------------------------
 # Environment setup
 # -----------------------------------------------------------------------------
-# BackupPC runs scripts with minimal PATH (often just /bin).
-# Ensure standard system paths are available for our tools.
-# We prepend to preserve any existing PATH entries.
+# BackupPC runs scripts with non-standard environment settings.
+# We normalize these for predictable behavior.
 
+# PATH: BackupPC uses minimal PATH (often just /bin).
+# Ensure standard system paths are available for our tools.
 _BACKUPPC_REQUIRED_PATHS="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Only add paths not already present
@@ -65,6 +66,12 @@ for _path in ${_BACKUPPC_REQUIRED_PATHS//:/ }; do
 done
 unset _path _BACKUPPC_REQUIRED_PATHS
 export PATH
+
+# UMASK: BackupPC uses 023, which creates directories without world-read.
+# Set standard umask for predictable file/directory permissions.
+# - Files: 644 (rw-r--r--)
+# - Directories: 755 (rwxr-xr-x)
+umask 022
 
 # Script identification (caller may override SCRIPT_NAME before sourcing)
 : "${SCRIPT_NAME:=$(basename "${BASH_SOURCE[-1]}" 2>/dev/null || basename "$0")}"

@@ -780,9 +780,9 @@ generate_summary() {
     log "  Archived binlogs: ${binlog_count}"
 
     if [[ -d "$CONFIG_DIR" ]]; then
-        local file_list
+        local file_list=""
         local file_count=0
-        local restricted_dirs
+        local restricted_dirs=""
         local restricted_dir_count=0
 
         file_list=$(find "$CONFIG_DIR" -type f 2>/dev/null || true)

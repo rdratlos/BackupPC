@@ -3,12 +3,12 @@
 # /usr/local/sbin/backuppc-staging-extract
 # =============================================================================
 #
-# Helper to extract files from Incus containers to staging directories,
-# preserving ownership and permissions through tar stream.
+# Privileged helper to extract files from Incus containers to staging
+# directories, preserving ownership and permissions through tar stream.
 #
-# This script runs as user backuppc and uses sudo internally to call
-# tarRestore for privilege elevation. The backuppc user must have sudoers
-# permission for /usr/local/sbin/tarRestore (standard BackupPC setup).
+# This script uses sudo tarRestore to write to staging directories, ensuring
+# container UIDs (which appear shifted on the host) are preserved for
+# BackupPC pooling and accurate restoration.
 #
 # Usage:
 #   backuppc-staging-extract <container> <staging_dir> <path> [path...]
@@ -36,12 +36,17 @@
 # Security:
 #   - Validates staging_dir is under allowed root in staging.conf
 #   - Config file must be owned by root:root, mode 644 or stricter
-#   - Uses sudo tarRestore for controlled privilege elevation
+#   - Uses sudo tarRestore for privilege separation
 #   - Rejects paths with .. components
 #
 # =============================================================================
 
 export LC_ALL=C
+
+# Ensure standard permissions for directories created during extraction
+# BackupPC's UmaskMode may be restrictive (e.g., 027) which would strip
+# world-readable bits from extracted directories like /etc
+umask 0022
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -61,11 +66,12 @@ INCUS="${INCUS_CMD:-$DEFAULT_INCUS}"
 # --preserve-permissions : Preserve file permissions
 readonly TAR_CREATE_OPTS="--format=posix --numeric-owner --preserve-permissions"
 
+# Script name for logging
+readonly SCRIPT_NAME="backuppc-staging-extract"
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-readonly SCRIPT_NAME="$(basename "$0")"
-
 _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SCRIPT_NAME}: $*" >&2
 }
@@ -231,15 +237,14 @@ extract_path() {
     fi
 
     # Stream tar from container, restore via sudo tarRestore
-    # Container tar runs as root inside container (in container namespace)
-    # tarRestore runs as root on host via sudo, preserving shifted UIDs
+    # Note: Container tar runs as root inside container
+    # tarRestore runs as root on host via sudo
     if ! "$INCUS" exec "$container" -- tar $TAR_CREATE_OPTS -cf - -C / "$src_path" 2>/dev/null \
         | sudo "$TARRESTORE" -C "$staging_dir"; then
         error "Failed to extract: ${container}:/${src_path}"
         return 5
     fi
 
-    debug "Extraction complete: ${src_path}"
     return 0
 }
 

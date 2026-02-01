@@ -55,6 +55,7 @@ test_start "PATH environment setup"
 [[ ":$PATH:" == *":/usr/local/bin:"* ]] && test_pass "PATH contains /usr/local/bin"
 [[ ":$PATH:" == *":/usr/sbin:"* ]] && test_pass "PATH contains /usr/sbin"
 [[ ":$PATH:" == *":/usr/bin:"* ]] && test_pass "PATH contains /usr/bin"
+[[ "$(umask)" == "0022" ]] && test_pass "umask is 0022"
 echo "" >&2
 
 # Test 3: Logging functions (all go to stderr)
