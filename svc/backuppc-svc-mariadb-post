@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# =============================================================================
+# MariaDB Instance Backup — Post-Hook for BackupPC
+# /usr/local/sbin/backuppc-svc-mariadb-post
+# =============================================================================
+#
+# Post hook for BackupPC *service backups* of the MariaDB instance.
+# Validates backup artifacts, records status, and manages cleanup.
+#
+# Responsibilities:
+#   • Validate staged artifacts (DB dumps, binlogs, config)
+#   • Record meta information (status, error, timestamps, xferOK)
+#   • On success: unmount BackupPC view and remove staging
+#   • On failure or xferOK!=1: keep bind mount + staging as evidence
+#
+# Command contract (BackupPC):
+#   DumpPostUserCmd should invoke this script with:
+#     backup-svc-mariadb-post.sh <cmdType> <xferOK>
+#   where:
+#     cmdType : BackupPC command type (string)
+#     xferOK  : 1=transfer ok, 0=transfer failed (may be empty in some paths)
+#
+# Key paths:
+#   • Staging (scratch): /export/mariadb/backuppc/server
+#   • BackupPC view:     /srv/backuppc/services/mariadb
+#
+# Artifact validation (in priority order):
+#   CRITICAL (failure if invalid):
+#     • db/mysql-system.sql.zst        - System database dump
+#     • db/mysql-system.sql.zst.sha256 - Checksum verification
+#
+#   IMPORTANT (warning if invalid):
+#     • db/binlogs/*.zst               - Binary log archives
+#
+#   ADVISORY (presence check only):
+#     • config/                        - Server configuration
+#     • meta/                          - Instance metadata
+#     • package-list/                  - Installed packages
+#     • systemd-list/                  - Enabled services
+#
+# Preconditions:
+#   • The user "backuppc" must be allowed to bind mount and unmount
+#     the service staging directory.
+#
+#   • Sudoers rules must be in place (see doc/setup):
+#       backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/server /srv/backuppc/services/mariadb
+#       backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/mariadb
+#       backuppc ALL = NOPASSWD: /usr/local/sbin/backuppc-staging-cleanup
+#
+# Exit codes:
+#   0  - Success
+#   1  - General error
+#   2  - Configuration/validation error
+#   3  - Staging operation failed
+#   4  - Container operation failed
+#   5  - Timeout
+#   10 - Lock acquisition failed
+#
+# Note:
+#   This script is *not* a general host backup but a staging step for
+#   application-consistent service artifacts that BackupPC will ingest.
+#
+# =============================================================================
+
+# Source shared library
+source /usr/local/lib/backuppc/common.sh
+
+# Enable strict error handling
+enable_strict_traps
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Service identification
+readonly SERVICE="mariadb"
+readonly APP_CT="mariadb"
+
+# Paths
+readonly STAGING_ROOT="/export/mariadb/backuppc/server"
+readonly VIEW_ROOT="/srv/backuppc/services"
+
+readonly STAGING_DIR="${STAGING_ROOT}/minerva.nepomuc.de"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE}"
+
+readonly META_DIR="${STAGING_DIR}/meta"
+
+# Artifact paths (relative to STAGING_DIR)
+readonly DB_DIR="${STAGING_DIR}/db"
+readonly CONFIG_DIR="${STAGING_DIR}/config"
+readonly BINLOG_DIR="${DB_DIR}/binlogs"
+
+# Critical artifacts (must pass validation)
+readonly MYSQL_SYSTEM_DUMP="${DB_DIR}/mysql-system.sql.zst"
+
+# =============================================================================
+# POST-SCRIPT EXIT HANDLER
+# =============================================================================
+# Override on_exit from common.sh to add post-script specific behavior
+
+post_exit_handler() {
+    local rc=$?
+
+    # Disable ERR trap during cleanup
+    trap - ERR
+
+    # If we're exiting due to a failure, use the captured code
+    local final_rc="$rc"
+    if [[ "$FAILED" -ne 0 ]]; then
+        final_rc="$FAIL_RC"
+    fi
+
+    # Always write meta information
+    write_meta_xferok "$META_DIR"
+
+    # Write final status
+    if [[ "$FAILED" -ne 0 ]]; then
+        write_meta_status "$META_DIR" "failed" "${FAIL_MSG:-unknown error}"
+        error "POST backup failed: ${FAIL_MSG:-unknown error}"
+    elif [[ "$XFER_OK" -ne 1 ]]; then
+        write_meta_status "$META_DIR" "failed" "xferOK=${XFER_OK}: BackupPC transfer failed"
+        error "BackupPC transfer failed (xferOK=${XFER_OK})"
+        FAILED=1
+        final_rc=100
+    else
+        write_meta_status "$META_DIR" "ok"
+        log "All checks OK and BackupPC transfer OK (xferOK=1)"
+    fi
+
+    # Finalize mount and staging based on success/failure
+    finalize_mount_and_staging
+
+    # Final log message
+    if [[ "$FAILED" -ne 0 ]]; then
+        error "==== ${SCRIPT_NAME} FAILED ===="
+    else
+        log "==== ${SCRIPT_NAME} completed successfully ===="
+    fi
+
+    exit "$final_rc"
+}
+
+# =============================================================================
+# STAGING FINALIZATION
+# =============================================================================
+
+finalize_mount_and_staging() {
+    # Policy:
+    #   • If FAILED != 0 OR xferOK != 1: keep bind mount + staging for evidence
+    #   • If success AND xferOK == 1: unmount view + remove staging
+
+    if should_preserve_staging; then
+        warn "Preserving bind mount + staging for evidence"
+        warn "  View:    ${VIEW_DIR}"
+        warn "  Staging: ${STAGING_DIR}"
+        return 0
+    fi
+
+    # Success path: cleanup
+    PHASE="cleanup_success"
+
+    # Remove bind mount (safe - won't fail script)
+    remove_bind_mount "$VIEW_DIR"
+
+    # Remove staging directory contents
+    log "Removing staging directory: ${STAGING_DIR}"
+    if ! cleanup_staging "$STAGING_DIR"; then
+        # This is unexpected on success - make it visible
+        error "Failed to remove staging directory: ${STAGING_DIR}"
+        # Don't fail the script - BackupPC transfer succeeded
+    fi
+
+    # Optional: remove empty view dir
+    rmdir "$VIEW_DIR" 2>/dev/null || true
+}
+
+# =============================================================================
+# ARTIFACT VALIDATION
+# =============================================================================
+
+validate_critical_artifacts() {
+    local errors=0
+
+    log "Validating critical artifacts"
+
+    # MySQL system database dump (REQUIRED)
+    PHASE="validate_mysql_system"
+    if ! verify_zstd_file "$MYSQL_SYSTEM_DUMP" "MySQL system database dump"; then
+        errors=$((errors + 1))
+    else
+        # Also verify checksum if present
+        if ! verify_file_checksum "$MYSQL_SYSTEM_DUMP"; then
+            errors=$((errors + 1))
+        fi
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        fail 10 "Critical artifact validation failed ($errors error(s))"
+    fi
+
+    log "Critical artifacts validated successfully"
+}
+
+validate_binlog_archives() {
+    local warnings=0
+    local verified=0
+
+    PHASE="validate_binlogs"
+
+    if [[ ! -d "$BINLOG_DIR" ]]; then
+        warn "Binlog directory not found: $BINLOG_DIR"
+        return 0
+    fi
+
+    log "Validating binary log archives"
+
+    # Find all .zst files in binlog directory
+    local binlog_files=()
+    while IFS= read -r -d '' file; do
+        binlog_files+=("$file")
+    done < <(find "$BINLOG_DIR" -maxdepth 1 -name '*.zst' -type f -print0 2>/dev/null)
+
+    if [[ ${#binlog_files[@]} -eq 0 ]]; then
+        warn "No binary log archives found in: $BINLOG_DIR"
+        return 0
+    fi
+
+    for binlog in "${binlog_files[@]}"; do
+        local name
+        name=$(basename "$binlog")
+
+        if ! zstd -t --quiet "$binlog" 2>/dev/null; then
+            warn "Binlog failed integrity test: $name"
+            warnings=$((warnings + 1))
+        else
+            verified=$((verified + 1))
+            debug "Binlog OK: $name"
+        fi
+    done
+
+    if [[ $warnings -gt 0 ]]; then
+        warn "Binary log validation: $verified OK, $warnings failed"
+    else
+        log "Binary log validation: $verified archive(s) OK"
+    fi
+
+    # Check position files exist
+    local pre_pos="${BINLOG_DIR}/pre-flush-position.txt"
+    local post_pos="${BINLOG_DIR}/post-flush-position.txt"
+
+    [[ -f "$pre_pos" ]] || warn "Missing pre-flush position file"
+    [[ -f "$post_pos" ]] || warn "Missing post-flush position file"
+}
+
+validate_advisory_artifacts() {
+    PHASE="validate_advisory"
+
+    log "Checking advisory artifacts"
+
+    # Config directory
+    verify_directory_exists "$CONFIG_DIR" "Server configuration" || true
+
+    # Meta directory (should exist from pre-script)
+    verify_directory_exists "$META_DIR" "Instance metadata" || true
+
+    # Package lists
+    local pkg_dir="${STAGING_DIR}/package-list"
+    verify_directory_exists "$pkg_dir" "Package lists" || true
+
+    # Systemd list
+    local systemd_dir="${STAGING_DIR}/systemd-list"
+    verify_directory_exists "$systemd_dir" "Systemd services" || true
+
+    # Human-readable grants file
+    local grants_file="${DB_DIR}/users-grants.sql"
+    if [[ -f "$grants_file" ]]; then
+        debug "Human-readable grants file present"
+    else
+        debug "Human-readable grants file not present (optional)"
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    log "==== POST backup start ===="
+
+    # Initialize xferOK from BackupPC arguments
+    init_xfer_status "DumpPostUserCmd" "${1:-}" "${2:-}"
+    log "BackupPC xferOK=${XFER_OK}"
+
+    # Validate staging directory exists
+    PHASE="validate_staging"
+    if [[ ! -d "$STAGING_DIR" ]]; then
+        fail 2 "Staging directory not found: $STAGING_DIR"
+    fi
+
+    # Validate critical artifacts (fails on error)
+    validate_critical_artifacts
+
+    # Validate binlog archives (warns on error)
+    validate_binlog_archives
+
+    # Check advisory artifacts (informational)
+    validate_advisory_artifacts
+
+    PHASE="done"
+    log "Post script validation complete"
+
+    # Exit handler will finalize based on xferOK and internal status
+}
+
+# Install our custom exit handler
+trap 'post_exit_handler' EXIT
+
+# Run main with command line arguments
+main "$@"

@@ -72,7 +72,8 @@ readonly CT_MYSQL_GROUP="mysql"
 readonly MYSQL_CONFIG_FILE="/etc/backuppc/mysql-backupmeta.cnf"
 
 # Staging directory (on fast LVM)
-readonly STAGING_DIR="/export/mariadb/backuppc/server"
+readonly STAGING_ROOT="/export/mariadb/backuppc/server"
+readonly STAGING_DIR="${STAGING_ROOT}/minerva.nepomuc.de"
 
 # Service bind-mount configuration
 readonly SERVICE_NAME="mariadb"
@@ -143,6 +144,10 @@ prepare_staging() {
     ensure_staging_dir "$CONFIG_DIR"
     ensure_staging_dir "$DB_DIR"
     ensure_staging_dir "$META_DIR"
+    local pkg_dir="${STAGING_DIR}/package-list"
+    ensure_staging_dir "$pkg_dir"
+    local systemd_dir="${STAGING_DIR}/systemd-list"
+    ensure_staging_dir "$systemd_dir"
 
     log "Staging directories ready"
 }
