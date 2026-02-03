@@ -353,7 +353,7 @@ if declare -f verify_zstd_file > /dev/null; then
 fi
 echo "" >&2
 
-# Test 17: Enable strict traps (for final exit handling)
+# Test 18: Enable strict traps (for final exit handling)
 test_start "Strict traps"
 enable_strict_traps
 test_pass "Strict traps enabled - on_exit will run at script end"

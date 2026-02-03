@@ -360,6 +360,7 @@ _run_cleanup_actions() {
     local i
     local action
     local cleanup_errors=0
+    local cleanup_output
 
     if [[ ${#_CLEANUP_ACTIONS[@]} -eq 0 ]]; then
         return 0
@@ -372,10 +373,26 @@ _run_cleanup_actions() {
         action="${_CLEANUP_ACTIONS[i]}"
         debug "Cleanup: $action"
 
-        # Run cleanup, capture errors but don't abort
-        if ! eval "$action" 2>/dev/null; then
-            warn "Cleanup action failed: $action"
-            cleanup_errors=$((cleanup_errors + 1))
+        # Run cleanup, capture stderr for logging on failure
+        cleanup_output=$(mktemp 2>/dev/null) || cleanup_output=""
+        if [[ -n "$cleanup_output" ]]; then
+            if ! eval "$action" 2>"$cleanup_output"; then
+                warn "Cleanup action failed: $action"
+                # Log captured stderr if non-empty
+                if [[ -s "$cleanup_output" ]]; then
+                    while IFS= read -r line; do
+                        debug "  cleanup stderr: $line"
+                    done < "$cleanup_output"
+                fi
+                cleanup_errors=$((cleanup_errors + 1))
+            fi
+            rm -f "$cleanup_output" 2>/dev/null || true
+        else
+            # Fallback if mktemp fails: run without capture
+            if ! eval "$action" 2>&1 | while IFS= read -r line; do debug "  $line"; done; then
+                warn "Cleanup action failed: $action"
+                cleanup_errors=$((cleanup_errors + 1))
+            fi
         fi
     done
 
@@ -757,18 +774,19 @@ capture_container_package_lists() {
     capture_errors=$(mktemp) || fail 5 "Failed to create temp file"
     register_cleanup "rm -f '$capture_errors'"
 
-    incus exec "$container" -- pacman -Qqen \
+    # Note: < /dev/null prevents stdin consumption issues if called from loops
+    incus exec "$container" -- pacman -Qqen < /dev/null \
         > "$dest_dir/pkglist-repo.txt" \
         2> "$capture_errors" \
         || rc=$?
     if [[ $rc -eq 0 ]]; then
-        incus exec "$container" -- pacman -Qqem \
+        incus exec "$container" -- pacman -Qqem < /dev/null \
             > "$dest_dir/pkglist-aur.txt" \
             || rc=$?
         if [[ $rc -ne 0 ]]; then
             log "No packages outside the official repositories were found (no AUR packages installed)"
         fi
-        incus exec "$container" -- pacman -Qe   > "${dest_dir}/pkg-versions.txt"
+        incus exec "$container" -- pacman -Qe < /dev/null > "${dest_dir}/pkg-versions.txt"
     else
         warn "Failed to query packages from container '$container' (rc=$rc):"
         while IFS= read -r line; do
@@ -1165,7 +1183,9 @@ verify_zstd_file() {
         return 1
     fi
 
-    log "Verified: $desc ($(stat -c%s "$file" | numfmt --to=iec-i)B)"
+    local size
+    size=$(stat -c%s "$file")
+    log "Verified: $desc ($(bytes_to_human "$size"))"
     return 0
 }
 
