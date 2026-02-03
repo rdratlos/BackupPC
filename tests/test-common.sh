@@ -98,6 +98,10 @@ else
     elapsed=$(timer_elapsed "test_operation")
     [[ "$elapsed" -ge 1 ]] && test_pass "timer_elapsed returned $elapsed seconds"
     timer_log "test_operation" "Test operation"
+    
+    # Test timer_elapsed with non-existent timer (should return 0, using current time as default)
+    elapsed_nonexistent=$(timer_elapsed "nonexistent_timer")
+    [[ "$elapsed_nonexistent" -eq 0 ]] && test_pass "timer_elapsed returns 0 for non-existent timer"
 fi
 echo "" >&2
 
@@ -341,19 +345,67 @@ fi
 if ! verify_directory_exists "/nonexistent/dir" "missing dir" 2>/dev/null; then
     test_pass "verify_directory_exists fails for missing directory"
 fi
+
+# Test verify_directory_exists with empty directory (should warn but succeed)
+if verify_directory_exists "$TEST_DIR" "empty directory" 2>/dev/null; then
+    test_pass "verify_directory_exists succeeds for empty directory (with warning)"
+fi
 rmdir "$TEST_DIR"
 
-# Test verify_file_checksum (without actual checksum file - should succeed)
+# Test verify_file_checksum - no checksum file (should succeed)
 TEST_FILE="/tmp/test-checksum-$$"
 echo "test" > "$TEST_FILE"
 if verify_file_checksum "$TEST_FILE"; then
     test_pass "verify_file_checksum succeeds when no checksum file exists"
 fi
-rm -f "$TEST_FILE"
 
-# Test function existence for zstd (can't test without zstd installed)
-if declare -f verify_zstd_file > /dev/null; then
-    test_pass "verify_zstd_file function exists"
+# Test verify_file_checksum - matching checksum
+(cd /tmp && sha256sum "test-checksum-$$" > "test-checksum-$$.sha256")
+if verify_file_checksum "$TEST_FILE"; then
+    test_pass "verify_file_checksum succeeds with matching checksum"
+fi
+
+# Test verify_file_checksum - mismatching checksum
+echo "0000000000000000000000000000000000000000000000000000000000000000  test-checksum-$$" > "/tmp/test-checksum-$$.sha256"
+if ! verify_file_checksum "$TEST_FILE" 2>/dev/null; then
+    test_pass "verify_file_checksum fails with mismatching checksum"
+fi
+rm -f "$TEST_FILE" "/tmp/test-checksum-$$.sha256"
+
+# Test verify_zstd_file (only if zstd is available)
+if command -v zstd &>/dev/null; then
+    TEST_ZSTD="/tmp/test-zstd-$$"
+    
+    # Create a valid zstd file
+    echo "test content for zstd" | zstd -q > "${TEST_ZSTD}.zst"
+    if verify_zstd_file "${TEST_ZSTD}.zst" "test zstd file"; then
+        test_pass "verify_zstd_file succeeds for valid zstd file"
+    fi
+    
+    # Test with non-existent file
+    if ! verify_zstd_file "/nonexistent/file.zst" "missing zstd" 2>/dev/null; then
+        test_pass "verify_zstd_file fails for missing file"
+    fi
+    
+    # Test with empty file
+    : > "${TEST_ZSTD}.empty.zst"
+    if ! verify_zstd_file "${TEST_ZSTD}.empty.zst" "empty zstd" 2>/dev/null; then
+        test_pass "verify_zstd_file fails for empty file"
+    fi
+    
+    # Test with corrupted/invalid zstd file
+    echo "not a zstd file" > "${TEST_ZSTD}.invalid.zst"
+    if ! verify_zstd_file "${TEST_ZSTD}.invalid.zst" "invalid zstd" 2>/dev/null; then
+        test_pass "verify_zstd_file fails for invalid zstd file"
+    fi
+    
+    rm -f "${TEST_ZSTD}.zst" "${TEST_ZSTD}.empty.zst" "${TEST_ZSTD}.invalid.zst"
+else
+    test_skip "verify_zstd_file tests (zstd not installed)"
+    # Still verify function exists
+    if declare -f verify_zstd_file > /dev/null; then
+        test_pass "verify_zstd_file function exists"
+    fi
 fi
 echo "" >&2
 
