@@ -24,6 +24,7 @@
 #   STAGING_CONFIG  - Override config file path (for testing)
 #   TARRESTORE_CMD  - Override tarRestore path (for testing)
 #   INCUS_CMD       - Override incus command path (for testing)
+#   DEBUG           - Set to 1 for verbose output
 #
 # Exit codes:
 #   0  - Success
@@ -39,8 +40,21 @@
 #   - Uses sudo tarRestore for privilege separation
 #   - Rejects paths with .. components
 #
+# Note:
+#   This script intentionally does NOT source common.sh to maintain
+#   minimal attack surface for a privileged helper. It implements
+#   its own logging and validation consistent with common.sh patterns.
+#
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# Strict mode (consistent with common.sh)
+# -----------------------------------------------------------------------------
+set -o errexit      # Exit on error
+set -o nounset      # Error on unset variables
+set -o pipefail     # Pipeline fails on first error
+
+# Ensure consistent locale
 export LC_ALL=C
 
 # Ensure standard permissions for directories created during extraction
@@ -67,19 +81,34 @@ INCUS="${INCUS_CMD:-$DEFAULT_INCUS}"
 readonly TAR_CREATE_OPTS="--format=posix --numeric-owner --preserve-permissions"
 
 # Script name for logging
-readonly SCRIPT_NAME="backuppc-staging-extract"
+readonly SCRIPT_NAME="${0##*/}"
 
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
+# Format: [YYYY-MM-DD HH:MM:SS] [LEVEL] message
+# Output to stderr only (no syslog/file for privileged helper)
+
 _log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SCRIPT_NAME}: $*" >&2
+    local level="$1"
+    shift
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] [${level}] ${SCRIPT_NAME}: $*" >&2
 }
 
-log() { _log "[INFO]  $*"; }
-error() { _log "[ERROR] $*"; }
-debug() { [[ "${DEBUG:-0}" == "1" ]] && _log "[DEBUG] $*"; }
-die()  { error "$2"; exit "$1"; }
+log()   { _log INFO  "$@"; }
+warn()  { _log WARN  "$@"; }
+error() { _log ERROR "$@"; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && _log DEBUG "$@" || true; }
+
+# die: Exit with error (consistent with common.sh fail())
+die() {
+    local rc="$1"
+    shift
+    error "$*"
+    exit "$rc"
+}
 
 # -----------------------------------------------------------------------------
 # Validation functions
@@ -88,6 +117,8 @@ die()  { error "$2"; exit "$1"; }
 # Validate config file security
 validate_config_file() {
     local config="$1"
+
+    debug "Validating config file: $config"
 
     if [[ ! -f "$config" ]]; then
         error "Config file not found: $config"
@@ -111,6 +142,7 @@ validate_config_file() {
         return 2
     fi
 
+    debug "Config file validated: $config"
     return 0
 }
 
@@ -120,12 +152,17 @@ load_allowed_roots() {
     local -n roots_ref="$2"
     roots_ref=()
 
+    debug "Loading allowed roots from: $config"
+
     while IFS= read -r line || [[ -n "$line" ]]; do
         # Skip empty lines and comments
         [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
         # Strip whitespace
         line="${line//[[:space:]]/}"
-        [[ -n "$line" ]] && roots_ref+=("$line")
+        if [[ -n "$line" ]]; then
+            roots_ref+=("$line")
+            debug "Loaded allowed root: $line"
+        fi
     done < "$config"
 
     if [[ ${#roots_ref[@]} -eq 0 ]]; then
@@ -133,6 +170,7 @@ load_allowed_roots() {
         return 2
     fi
 
+    log "Loaded ${#roots_ref[@]} allowed root(s) from config"
     return 0
 }
 
@@ -141,6 +179,8 @@ validate_staging_path() {
     local path="$1"
     shift
     local -a allowed_roots=("$@")
+
+    debug "Validating staging path: $path"
 
     # Canonicalize path (resolve symlinks, remove . and ..)
     local resolved
@@ -158,6 +198,7 @@ validate_staging_path() {
 
         # Path must be under root (not equal to root itself)
         if [[ "$resolved" == "$resolved_root"/* ]]; then
+            debug "Path validated: $resolved (under $resolved_root)"
             return 0
         fi
     done
@@ -169,6 +210,8 @@ validate_staging_path() {
 # Validate container path (no .. traversal)
 validate_container_path() {
     local path="$1"
+
+    debug "Validating container path: $path"
 
     # Reject paths with .. components
     if [[ "$path" =~ (^|/)\.\.(/|$) ]]; then
@@ -188,12 +231,15 @@ validate_container_path() {
         return 3
     fi
 
+    debug "Container path validated: $path"
     return 0
 }
 
 # Validate container exists and is running
 validate_container() {
     local container="$1"
+
+    debug "Validating container: $container"
 
     # Check incus command exists
     if [[ ! -x "$INCUS" ]]; then
@@ -215,6 +261,7 @@ validate_container() {
         return 4
     fi
 
+    debug "Container validated: $container (running)"
     return 0
 }
 
@@ -245,6 +292,7 @@ extract_path() {
         return 5
     fi
 
+    debug "Extraction complete: ${container}:/${src_path}"
     return 0
 }
 
@@ -253,6 +301,8 @@ load_paths_from_file() {
     local listfile="$1"
     local -n paths_ref="$2"
     paths_ref=()
+
+    log "Loading paths from file: $listfile"
 
     if [[ ! -f "$listfile" ]]; then
         error "File list not found: $listfile"
@@ -270,7 +320,10 @@ load_paths_from_file() {
         # Strip leading/trailing whitespace
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
-        [[ -n "$line" ]] && paths_ref+=("$line")
+        if [[ -n "$line" ]]; then
+            paths_ref+=("$line")
+            debug "Loaded path: $line"
+        fi
     done < "$listfile"
 
     if [[ ${#paths_ref[@]} -eq 0 ]]; then
@@ -278,6 +331,7 @@ load_paths_from_file() {
         return 1
     fi
 
+    log "Loaded ${#paths_ref[@]} path(s) from file list"
     return 0
 }
 
@@ -296,6 +350,14 @@ Arguments:
   staging_dir  - Destination staging directory
   path         - Path(s) relative to container root (e.g., "etc" or "etc/nginx")
   --file-list  - Read paths from file (one per line, # comments supported)
+
+Exit codes:
+  0 - Success
+  1 - Invalid arguments
+  2 - Configuration error
+  3 - Security validation failed
+  4 - Container error
+  5 - Extraction failed
 
 Examples:
   # Extract single directory
@@ -324,6 +386,10 @@ main() {
     local container="$1"
     local staging_dir="$2"
     shift 2
+
+    echo "Debug mdoe: $DEBUG"
+
+    debug "Starting extraction: container=$container staging=$staging_dir"
 
     # Validate config file
     if ! validate_config_file "$CONFIG_FILE"; then
@@ -375,9 +441,12 @@ main() {
 
     # Extract each path
     local failed=0
+    local extracted=0
     for path in "${paths[@]}"; do
         if ! extract_path "$container" "$staging_dir" "$path"; then
-            ((failed++))
+            failed=$((failed + 1))
+        else
+            extracted=$((extracted + 1))
         fi
     done
 
@@ -385,7 +454,8 @@ main() {
         die 5 "Failed to extract $failed path(s)"
     fi
 
-    log "Extraction complete: ${#paths[@]} path(s) to $staging_dir"
+    log "Extraction complete: ${extracted} path(s) to $staging_dir"
+    log "==== ${SCRIPT_NAME} completed successfully ===="
     exit 0
 }
 

@@ -32,11 +32,23 @@
 # Sudoers entry:
 #   backuppc ALL=(root) NOPASSWD: /usr/local/sbin/backuppc-staging-cleanup
 #
+# Note:
+#   This script intentionally does NOT source common.sh to maintain
+#   minimal attack surface for a privileged helper. It implements
+#   its own logging and validation consistent with common.sh patterns.
+#
 # =============================================================================
 
-set -euo pipefail
+# -----------------------------------------------------------------------------
+# Strict mode (consistent with common.sh)
+# -----------------------------------------------------------------------------
+set -o errexit      # Exit on error
+set -o nounset      # Error on unset variables
+set -o pipefail     # Pipeline fails on first error
 
+# -----------------------------------------------------------------------------
 # Configuration
+# -----------------------------------------------------------------------------
 # Allow override via environment for testing (but not via sudo by default)
 readonly CONFIG="${BACKUPPC_STAGING_ROOTS_CONF:-/etc/backuppc/staging.conf}"
 readonly SCRIPT_NAME="${0##*/}"
@@ -45,19 +57,36 @@ readonly MIN_DEPTH=2  # Minimum depth below staging root (e.g., /root/service)
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
+# Format: [YYYY-MM-DD HH:MM:SS] [LEVEL] message
+# Output to stderr only (no syslog/file for privileged helper)
+
 _log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${SCRIPT_NAME}: $*" >&2
+    local level="$1"
+    shift
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] [${level}] ${SCRIPT_NAME}: $*" >&2
 }
 
-log() { _log "[INFO]  $*"; }
-err() { _log "[ERROR] $*"; }
-debug() { [[ "${DEBUG:-0}" == "1" ]] && _log "[DEBUG] $*"; }
-die()  { err "$2"; exit "$1"; }
+log()   { _log INFO  "$@"; }
+warn()  { _log WARN  "$@"; }
+error() { _log ERROR "$@"; }
+debug() { [[ "${DEBUG:-0}" == "1" ]] && _log DEBUG "$@" || true; }
+
+# die: Exit with error (consistent with common.sh fail())
+die() {
+    local rc="$1"
+    shift
+    error "$*"
+    exit "$rc"
+}
 
 # -----------------------------------------------------------------------------
 # Validate configuration file security
 # -----------------------------------------------------------------------------
 validate_config() {
+    debug "Validating config file: $CONFIG"
+
     if [[ ! -f "$CONFIG" ]]; then
         die 2 "Configuration file not found: $CONFIG"
     fi
@@ -77,6 +106,8 @@ validate_config() {
     if [[ "${perms: -1}" =~ [2367] ]]; then
         die 2 "Configuration file must not be world-writable (found mode $perms): $CONFIG"
     fi
+
+    debug "Config file validated: $CONFIG"
 }
 
 # -----------------------------------------------------------------------------
@@ -85,6 +116,8 @@ validate_config() {
 load_allowed_roots() {
     local -n roots_ref=$1
     local line
+
+    log "Loading allowed roots from: $CONFIG"
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         # Skip comments and blank lines
@@ -99,16 +132,19 @@ load_allowed_roots() {
 
         # Validate path is absolute
         if [[ "$line" != /* ]]; then
-            err "Ignoring non-absolute path in config: $line"
+            warn "Ignoring non-absolute path in config: $line"
             continue
         fi
 
         roots_ref+=("$line")
+        debug "Loaded allowed root: $line"
     done < "$CONFIG"
 
     if [[ ${#roots_ref[@]} -eq 0 ]]; then
         die 2 "No valid staging roots defined in: $CONFIG"
     fi
+
+    log "Loaded ${#roots_ref[@]} allowed root(s) from config"
 }
 
 # -----------------------------------------------------------------------------
@@ -122,6 +158,8 @@ validate_path() {
     local matched_root=""
     local root
 
+    debug "Validating path: $target"
+
     for root in "${allowed_roots[@]}"; do
         # Canonicalize the allowed root (may not exist, so use -m)
         local canonical_root
@@ -130,6 +168,7 @@ validate_path() {
         # Check if target starts with this root followed by /
         if [[ "$target" == "$canonical_root"/* ]]; then
             matched_root="$canonical_root"
+            debug "Path matches root: $canonical_root"
             break
         fi
     done
@@ -149,7 +188,7 @@ validate_path() {
         die 3 "Path too shallow (depth $depth, minimum $MIN_DEPTH): $target"
     fi
 
-    log "Validated: $target (under $matched_root, depth $depth)"
+    log "Path validated: $target (under $matched_root, depth $depth)"
 }
 
 # -----------------------------------------------------------------------------
@@ -187,14 +226,26 @@ do_cleanup() {
 main() {
     # Argument validation
     if [[ $# -ne 1 ]]; then
-        echo "Usage: $SCRIPT_NAME <staging-directory>" >&2
-        echo "" >&2
-        echo "Safely removes contents of a BackupPC staging directory." >&2
-        echo "Target must be under a root defined in: $CONFIG" >&2
+        cat >&2 << EOF
+Usage: $SCRIPT_NAME <staging-directory>
+
+Safely removes contents of a BackupPC staging directory.
+Target must be under a root defined in: $CONFIG
+
+Exit codes:
+  0 - Success
+  1 - Usage error
+  2 - Configuration error
+  3 - Path validation failed
+  4 - Target not a directory
+  5 - Cleanup failed
+EOF
         exit 1
     fi
 
     local target="$1"
+
+    debug "Starting cleanup for: $target"
 
     # Basic sanity checks before any filesystem operations
     if [[ -z "$target" || "$target" == "/" || "$target" == "." || "$target" == ".." ]]; then
@@ -231,6 +282,8 @@ main() {
 
     # Perform cleanup
     do_cleanup "$real_target"
+
+    log "==== ${SCRIPT_NAME} completed successfully ===="
 }
 
 main "$@"

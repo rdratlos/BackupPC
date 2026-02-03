@@ -18,11 +18,18 @@
 #   3. Tests actual cleanup operations
 #   4. Cleans up after itself
 #
+# Exit codes:
+#   0 - All tests passed
+#   1 - Some tests failed or prerequisites not met
+#
 # =============================================================================
 
-# Explicitly NOT using set -e - we want to handle errors ourselves
-set -u  # Only undefined variables are errors
-set -o pipefail
+# -----------------------------------------------------------------------------
+# Strict mode (match script under test)
+# -----------------------------------------------------------------------------
+set -o nounset      # Error on unset variables
+set -o pipefail     # Pipeline fails on first error
+# Note: NOT using errexit - we handle errors explicitly
 
 # -----------------------------------------------------------------------------
 # Path setup - find project root relative to this script
@@ -36,7 +43,13 @@ TEST_CONFIG="$TEST_BASE/staging.conf"
 TEST_STAGING="$TEST_BASE/staging"
 
 # -----------------------------------------------------------------------------
-# Output formatting
+# Debug mode - pass through to script under test
+# -----------------------------------------------------------------------------
+# Usage: TEST_DEBUG=1 sudo ./tests/test-staging-cleanup.sh
+TEST_DEBUG="${TEST_DEBUG:-0}"
+
+# -----------------------------------------------------------------------------
+# Output formatting (consistent with common.sh patterns)
 # -----------------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,11 +61,17 @@ passed=0
 failed=0
 skipped=0
 
-log_info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
-log_test()  { echo -e "${YELLOW}[TEST]${NC} $*"; }
-log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; ((passed++)); }
-log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; ((failed++)); }
-log_skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; ((skipped++)); }
+_log() {
+    local level="$1"
+    shift
+    echo -e "[${level}] $*"
+}
+
+log_info()  { _log "${BLUE}INFO${NC}" "$*"; }
+log_test()  { _log "${YELLOW}TEST${NC}" "$*"; }
+log_pass()  { _log "${GREEN}PASS${NC}" "$*"; ((passed++)); }
+log_fail()  { _log "${RED}FAIL${NC}" "$*"; ((failed++)); }
+log_skip()  { _log "${YELLOW}SKIP${NC}" "$*"; ((skipped++)); }
 
 # -----------------------------------------------------------------------------
 # Test helpers
@@ -60,7 +79,7 @@ log_skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; ((skipped++)); }
 
 # Run cleanup script with test config
 run_cleanup() {
-    BACKUPPC_STAGING_ROOTS_CONF="$TEST_CONFIG" "$CLEANUP_SCRIPT" "$@"
+    DEBUG="$TEST_DEBUG" BACKUPPC_STAGING_ROOTS_CONF="$TEST_CONFIG" "$CLEANUP_SCRIPT" "$@"
 }
 
 # Expect a specific exit code - with detailed diagnostics
@@ -521,6 +540,15 @@ test_cleanup_deep_nesting() {
     expect_cleaned "$target" "Cleanup of deeply nested structure (10 levels)"
 }
 
+test_cleanup_empty_directory() {
+    log_test "Testing cleanup of already empty directory..."
+
+    local target="$TEST_STAGING/service8/empty"
+    mkdir -p "$target"
+
+    expect_cleaned "$target" "Cleanup of empty directory (idempotent)"
+}
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -530,6 +558,7 @@ main() {
     echo "============================================="
     echo "Project root: $PROJECT_ROOT"
     echo "Script under test: $CLEANUP_SCRIPT"
+    echo "Debug mode: $([ "$TEST_DEBUG" = "1" ] && echo "enabled" || echo "disabled")"
     echo "============================================="
     echo ""
 
@@ -569,6 +598,7 @@ main() {
     test_cleanup_readonly_files || true
     test_cleanup_preserves_siblings || true
     test_cleanup_deep_nesting || true
+    test_cleanup_empty_directory || true
 
     echo ""
     echo "============================================="
