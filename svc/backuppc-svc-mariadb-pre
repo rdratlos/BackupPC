@@ -670,7 +670,7 @@ process_binlogs() {
             continue
         fi
 
-        log "  Archiving: ${binlog_name}"
+        log_indent "Archiving: ${binlog_name}"
 
         # Compress inside container, write to staging area on same filesystem
         rc=0
@@ -768,16 +768,16 @@ generate_summary() {
     log "View directory:    ${VIEW_DIR}"
 
     if [[ -f "${DB_DIR}/mysql-system.sql.zst" ]]; then
-        log "  mysql-system.sql.zst: $(du -h "${DB_DIR}/mysql-system.sql.zst" | cut -f1)"
+        log_indent "mysql-system.sql.zst: $(du -h "${DB_DIR}/mysql-system.sql.zst" | cut -f1)"
     fi
 
     if [[ -f "${DB_DIR}/users-grants.sql" ]]; then
-        log "  users-grants.sql: $(du -h "${DB_DIR}/users-grants.sql" | cut -f1)"
+        log_indent "users-grants.sql: $(du -h "${DB_DIR}/users-grants.sql" | cut -f1)"
     fi
 
     local binlog_count
     binlog_count=$(find "$BINLOG_DIR" -name "*.zst" -type f 2>/dev/null | wc -l)
-    log "  Archived binlogs: ${binlog_count}"
+    log_indent "Archived binlogs: ${binlog_count}"
 
     if [[ -d "$CONFIG_DIR" ]]; then
         local file_list=""
@@ -796,26 +796,26 @@ generate_summary() {
         fi
 
         if [[ $restricted_dir_count -gt 0 ]]; then
-            log "  Config files: ${file_count}+ (${restricted_dir_count} restricted dirs)"
+            log_indent "Config files: ${file_count}+ (${restricted_dir_count} restricted dirs)"
         else
-            log "  Config files: ${file_count}"
+            log_indent "Config files: ${file_count}"
         fi
     fi
 
     if [[ -f "${META_DIR}/instance-metadata.txt" ]]; then
-        log "  Metadata: $(du -h "${META_DIR}/instance-metadata.txt" | cut -f1)"
+        log_indent "Metadata: $(du -h "${META_DIR}/instance-metadata.txt" | cut -f1)"
     fi
 
     if [[ -f "${STAGING_DIR}/package-list" ]]; then
-        log "  Installed packages: $(cat "${STAGING_DIR}/package-list/pkglist-repo.txt" | wc -l)"
+        log_indent "Installed packages: $(cat "${STAGING_DIR}/package-list/pkglist-repo.txt" | wc -l)"
     fi
 
     if [[ -f "${STAGING_DIR}/systemd-list/systemd-enabled.txt" ]]; then
-        log "  Systemd enabled units: $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c "abled$")"
-        log "    Enabled services:      $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.service')"
-        log "    Enabled timers:        $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.timer')"
-        log "    Enabled sockets:       $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.socket')"
-        log "    Enabled targets:       $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.target')"
+        log_indent "Systemd enabled units: $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c "abled$")"
+        log_indent "Enabled services:      $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.service')" "    "
+        log_indent "Enabled timers:        $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.timer')" "    "
+        log_indent "Enabled sockets:       $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.socket')" "    "
+        log_indent "Enabled targets:       $(cat "${STAGING_DIR}/systemd-list/systemd-enabled.txt" | grep -c '\.target')" "    "
     fi
 }
 
@@ -847,9 +847,7 @@ main() {
     require_command sha256sum
 
     # Check container is running
-    if ! container_running "$APP_CT"; then
-        fail 4 "Container not running: ${APP_CT}"
-    fi
+    require_running_container "${APP_CT}"
 
     # Validate prerequisites
     require_container_command "${APP_CT}" zstd
