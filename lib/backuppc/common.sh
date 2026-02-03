@@ -130,6 +130,22 @@ warn()  { _log WARN  "$@"; }
 error() { _log ERROR "$@"; }
 debug() { [[ "${DEBUG:-0}" == "1" ]] && _log DEBUG "$@" || true; }
 
+# log_indent: Log with indentation for nested operations
+# Usage: log_indent "message"              # default 2-space indent
+#        log_indent "message" "    "       # custom 4-space indent
+#        log_indent "message" "  " WARN    # custom indent + level
+#
+# Useful for showing hierarchy in extraction or multi-step operations:
+#   log "Processing container: $CT"
+#   log_indent "Extracting /etc/myapp"
+#   log_indent "Extracting /var/lib/myapp"
+log_indent() {
+    local message="$1"
+    local indent="${2:-  }"
+    local level="${3:-INFO}"
+    _log "$level" "${indent}${message}"
+}
+
 # -----------------------------------------------------------------------------
 # Phase tracking and failure state
 # -----------------------------------------------------------------------------
@@ -726,6 +742,33 @@ container_running() {
     local status
     status=$(incus info "$container" 2>/dev/null | grep -E '^Status:' | awk '{print $2}')
     [[ "$status" == "RUNNING" ]]
+}
+
+# require_running_container: Validate container exists and is running
+# Usage: require_running_container <container>
+#
+# Combines existence and running checks with clear error messages.
+# Fails with exit code 4 (container operation failed) if either check fails.
+#
+# Example:
+#   require_running_container "$CONTAINER"
+#   # Now safe to use extract_container_path, etc.
+require_running_container() {
+    local container="$1"
+
+    if [[ -z "$container" ]]; then
+        fail 2 "require_running_container: container name required"
+    fi
+
+    if ! container_exists "$container"; then
+        fail 4 "Container does not exist: $container"
+    fi
+
+    if ! container_running "$container"; then
+        fail 4 "Container is not running: $container"
+    fi
+
+    debug "Container validated: $container (exists and running)"
 }
 
 # wait_container_ready: Wait for container to be running and network ready

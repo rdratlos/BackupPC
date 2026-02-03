@@ -65,12 +65,22 @@ PHASE="init"
 
 All logging writes to: syslog, script log file, and stderr (keeps stdout clean).
 
-| Function    | Level | Description                  |
-|-------------|-------|------------------------------|
-| `log "msg"`   | INFO  | General information          |
-| `warn "msg"`  | WARN  | Warning conditions           |
-| `error "msg"` | ERROR | Error conditions             |
-| `debug "msg"` | DEBUG | Debug info (only if `DEBUG=1`) |
+| Function                          | Level | Description                            |
+|-----------------------------------|-------|----------------------------------------|
+| `log "msg"`                         | INFO  | General information                    |
+| `warn "msg"`                        | WARN  | Warning conditions                     |
+| `error "msg"`                       | ERROR | Error conditions                       |
+| `debug "msg"`                       | DEBUG | Debug info (only if `DEBUG=1`)           |
+| `log_indent "msg" [indent] [level]` | INFO  | Indented message for nested operations |
+
+`log_indent` **usage:**
+
+```bash
+log "Processing container: $CONTAINER"
+log_indent "Extracting /etc/myapp"
+log_indent "Extracting /var/lib/myapp"
+log_indent "Skipping /tmp" "  " WARN    # Custom indent + warning level
+```
 
 ## Error Handling
 
@@ -128,12 +138,25 @@ All logging writes to: syslog, script log file, and stderr (keeps stdout clean).
 |---------------------------------------------|-------------------------------------------------------|
 | `container_exists <ct>`                       | Check if container exists                             |
 | `container_running <ct>`                      | Check if container is running                         |
+| `require_running_container <ct>`              | Validate container exists and is running (or fail)    |
 | `wait_container_ready <ct> [timeout]`         | Wait for container to be ready (default: 30s)         |
 | `extract_container_path <ct> <src> <dest>`    | Extract path relative to `/`, preserving structure      |
 | `extract_container_dir <ct> <src> <dest>`     | Extract directory contents only (no parent structure) |
 | `copy_container_dir <ct> <src> <dest>`        | Copy directory contents (backuppc ownership)          |
 | `capture_container_package_lists <ct> <dest>` | Capture pacman package lists (Arch/Manjaro)           |
 | `require_container_command <ct> <cmd>`        | Fail if command not available in container            |
+
+**Container validation pattern:**
+
+```bash
+# Use require_running_container at script start to fail fast
+PHASE="validate"
+require_running_container "$CONTAINER"
+
+# Now safe to use extraction functions
+PHASE="extraction"
+extract_container_path "$CONTAINER" "etc/myapp" "$STAGING"
+```
 
 **Extraction functions compared:**
 
@@ -183,12 +206,12 @@ These functions support post-backup scripts that need to handle BackupPC transfe
 |----------|----------------------------------------------------|
 | `XFER_OK`  | BackupPC transfer status: `0` = failure, `1` = success |
 
-| Function                                            | Purpose                                                      |
-|-----------------------------------------------------|--------------------------------------------------------------|
-| `init_xfer_status <expected> <actual> [xferOK]`       | Validate cmdType and parse xferOK status                     |
-| `should_preserve_staging`                             | Returns 0 (true) if staging should be kept for investigation |
+| Function                                      | Purpose                                                      |
+|-----------------------------------------------|--------------------------------------------------------------|
+| `init_xfer_status <expected> <actual> [xferOK]` | Validate cmdType and parse xferOK status                     |
+| `should_preserve_staging`                       | Returns 0 (true) if staging should be kept for investigation |
 
-**Parameters for `init_xfer_status`:**
+**Parameters for** `init_xfer_status`**:**
 
 - `<expected>` - The command type this script expects (e.g., `"DumpPostUserCmd"`)
 - `<actual>` - The actual `$cmdType` passed by BackupPC (`$1`)
@@ -271,16 +294,16 @@ fi
 
 These exit codes are reserved for the common.sh library and should not be used by service scripts:
 
-| Code | Meaning                              | Used By                        |
-|------|--------------------------------------|--------------------------------|
-| 0    | Success                              | All scripts                    |
-| 1    | General error / `die()`              | `die()`, general failures      |
-| 2    | Configuration/validation error       | `require_*`, `load_config`     |
-| 3    | Staging operation failed             | `cleanup_staging`, `ensure_staging_dir` |
-| 4    | Container operation failed           | `extract_*`, `copy_*`, `wait_container_ready` |
-| 5    | Timeout / temp file creation failed  | `wait_container_ready`, `mktemp` failures |
-| 10   | Lock acquisition failed              | `acquire_lock`                 |
-| 20   | Mount verification failed            | `ensure_bind_mount`            |
+| Code | Meaning                             | Used By                                 |
+|------|-------------------------------------|-----------------------------------------|
+| 0    | Success                             | All scripts                             |
+| 1    | General error / `die()`               | `die()`, general failures                 |
+| 2    | Configuration/validation error      | `require_*`, `load_config`                  |
+| 3    | Staging operation failed            | `cleanup_staging`, `ensure_staging_dir`     |
+| 4    | Container operation failed          | `extract_*`, `copy_*`, `wait_container_ready` |
+| 5    | Timeout / temp file creation failed | `wait_container_ready`, `mktemp` failures   |
+| 10   | Lock acquisition failed             | `acquire_lock`                            |
+| 20   | Mount verification failed           | `ensure_bind_mount`                       |
 
 ## Service-Specific Codes (30-99)
 
@@ -288,13 +311,13 @@ Service scripts should use exit codes in the range **30-99** for service-specifi
 
 **Recommended structure for service scripts:**
 
-| Range | Category                    | Example Usage                          |
-|-------|-----------------------------|----------------------------------------|
+| Range | Category                    | Example Usage                               |
+|-------|-----------------------------|---------------------------------------------|
 | 30-39 | Database operation errors   | Connection failed, query error, dump failed |
-| 40-49 | Service-specific validation | Missing config, invalid state          |
-| 50-59 | Extraction/transfer errors  | Failed to extract files, permission denied |
-| 60-69 | Post-backup validation      | Artifact missing, checksum mismatch    |
-| 70-99 | Reserved for future use     | -                                      |
+| 40-49 | Service-specific validation | Missing config, invalid state               |
+| 50-59 | Extraction/transfer errors  | Failed to extract files, permission denied  |
+| 60-69 | Post-backup validation      | Artifact missing, checksum mismatch         |
+| 70-99 | Reserved for future use     | \-                                           |
 
 **Example service script exit codes:**
 
@@ -312,11 +335,11 @@ fail 61 "Checksum verification failed"
 
 Codes 100 and above may have special meanings in some contexts:
 
-| Code    | Meaning                              |
-|---------|--------------------------------------|
-| 126     | Command found but not executable     |
-| 127     | Command not found                    |
-| 128+N   | Fatal signal N (e.g., 137 = SIGKILL) |
+| Code  | Meaning                              |
+|-------|--------------------------------------|
+| 126   | Command found but not executable     |
+| 127   | Command not found                    |
+| 128+N | Fatal signal N (e.g., 137 = SIGKILL) |
 
 **Note:** Avoid using codes above 125 in your scripts as they may be interpreted as signal-related exits by shells and process managers.
 

@@ -65,7 +65,11 @@ warn "This is a WARN message"
 error "This is an ERROR message"
 DEBUG=1 debug "This is a DEBUG message (should appear)"
 DEBUG=0 debug "This DEBUG message should NOT appear"
+log_indent "This is an indented INFO message"
+log_indent "Custom indent message" "    "
+log_indent "Indented warning" "  " WARN
 test_pass "Logging functions executed without error"
+test_pass "log_indent executed without error"
 echo "" >&2
 
 # Test 4: Validation helpers
@@ -210,9 +214,9 @@ echo "" >&2
 
 # Test 14: Container functions (existence check only)
 test_start "Container functions (signature validation)"
-for func in container_exists container_running wait_container_ready \
-            extract_container_path extract_container_dir copy_container_dir \
-            capture_container_package_lists require_container_command; do
+for func in container_exists container_running require_running_container \
+            wait_container_ready extract_container_path extract_container_dir \
+            copy_container_dir capture_container_package_lists require_container_command; do
     if declare -f "$func" > /dev/null; then
         test_pass "$func function exists"
     else
