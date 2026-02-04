@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Nextcloud Service Backup — Post-Hook for BackupPC
+# /usr/local/sbin/backuppc-svc-nextcloud-post
+# =============================================================================
+#
+# Post hook for BackupPC *service backups* of the Nextcloud service.
+# Validates backup artifacts, records status, and manages cleanup.
+#
+# Responsibilities:
+#   • Restore service operation (disable maintenance mode)
+#   • Validate staged artifacts (DB dump, config snapshot)
+#   • Record meta information (status, error, timestamps, xferOK)
+#   • On success: unmount BackupPC view and remove staging
+#   • On failure or xferOK!=1: keep bind mount + staging as evidence
+#
+# Command contract (BackupPC):
+#   DumpPostUserCmd should invoke this script with:
+#     backuppc-svc-nextcloud-post <cmdType> <xferOK>
+#   where:
+#     cmdType : BackupPC command type (string)
+#     xferOK  : 1=transfer ok, 0=transfer failed (may be empty in some paths)
+#
+# Key paths:
+#   • Staging (scratch): /export/mariadb/backuppc/services/nextcloud
+#   • BackupPC view:     /srv/backuppc/services/nextcloud
+#
+# Artifact validation (in priority order):
+#   CRITICAL (failure if invalid):
+#     • db/mariadb.sql.zst            - Database dump
+#
+#   ADVISORY (presence check only):
+#     • config/                       - Application configuration snapshot
+#     • meta/                         - Backup metadata
+#     • package-list/                 - Container package lists
+#     • systemd-list/                 - Enabled services
+#
+# Preconditions:
+#   • The user "backuppc" must be allowed to bind mount and unmount
+#     the service staging directory.
+#
+#   • Sudoers rules must be in place (see doc/setup):
+#       backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services /srv/backuppc/services
+#       backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/nextcloud
+#       backuppc ALL = NOPASSWD: /usr/local/sbin/backuppc-staging-cleanup
+#
+# Exit codes:
+#   0  - Success
+#   1  - General error
+#   2  - Configuration/validation error
+#   3  - Staging operation failed
+#   4  - Container operation failed
+#   5  - Timeout
+#   10 - Lock acquisition failed
+#   100 - BackupPC transfer failed (xferOK=0)
+#
+# Note:
+#   This script is *not* a general host backup but a staging step for
+#   application-consistent service artifacts that BackupPC will ingest.
+#
+# =============================================================================
+
+# Source shared library
+source /usr/local/lib/backuppc/common.sh
+
+# Enable strict error handling
+enable_strict_traps
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Service identification
+readonly SERVICE="nextcloud"
+readonly APP_CT="nextcloud-server"
+
+# Paths
+readonly STAGING_ROOT="/export/mariadb/backuppc/services"
+readonly VIEW_ROOT="/srv/backuppc/services"
+
+readonly STAGING_DIR="${STAGING_ROOT}/${SERVICE}"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE}"
+
+readonly META_DIR="${STAGING_DIR}/meta"
+
+# Artifact paths (relative to STAGING_DIR)
+readonly DB_DIR="${STAGING_DIR}/db"
+readonly CONFIG_DIR="${STAGING_DIR}/config"
+
+# Critical artifacts (must pass validation)
+readonly DB_DUMP="${DB_DIR}/mariadb.sql.zst"
+
+# =============================================================================
+# POST-SCRIPT EXIT HANDLER
+# =============================================================================
+# Override on_exit from common.sh to add post-script specific behavior
+
+post_exit_handler() {
+    local rc=$?
+
+    # Disable ERR trap during cleanup
+    trap - ERR
+
+    # If we're exiting due to a failure, use the captured code
+    local final_rc="$rc"
+    if [[ "$FAILED" -ne 0 ]]; then
+        final_rc="$FAIL_RC"
+    fi
+
+    # Always write meta information
+    write_meta_xferok "$META_DIR"
+
+    # Run application cleanup (disable maintenance mode)
+    app_cleanup
+
+    # Write final status
+    if [[ "$FAILED" -ne 0 ]]; then
+        write_meta_status "$META_DIR" "failed" "${FAIL_MSG:-unknown error}"
+        error "POST backup failed: ${FAIL_MSG:-unknown error}"
+    elif [[ "$XFER_OK" -ne 1 ]]; then
+        write_meta_status "$META_DIR" "failed" "xferOK=${XFER_OK}: BackupPC transfer failed"
+        error "BackupPC transfer failed (xferOK=${XFER_OK})"
+        FAILED=1
+        final_rc=100
+    else
+        write_meta_status "$META_DIR" "ok"
+        log "All checks OK and BackupPC transfer OK (xferOK=1)"
+    fi
+
+    # Finalize mount and staging based on success/failure
+    finalize_mount_and_staging
+
+    # Final log message
+    if [[ "$FAILED" -ne 0 ]]; then
+        error "==== ${SCRIPT_NAME} FAILED ===="
+    else
+        log "==== ${SCRIPT_NAME} completed successfully ===="
+    fi
+
+    exit "$final_rc"
+}
+
+# =============================================================================
+# APPLICATION CLEANUP
+# =============================================================================
+
+app_cleanup() {
+    # Always attempt to disable maintenance mode
+    PHASE="cleanup_maintenance_off"
+    log "Disabling Nextcloud maintenance mode"
+
+    if ! incus exec "$APP_CT" -- occ maintenance:mode --off; then
+        error "Failed to disable maintenance mode (container=${APP_CT})"
+        # Don't override earlier failure state
+        if [[ "$FAILED" -eq 0 ]]; then
+            FAILED=1
+            FAIL_RC=90
+            FAIL_MSG="cleanup failed: could not disable maintenance mode"
+        fi
+    else
+        log "Maintenance mode disabled"
+    fi
+
+    # Remove temporary config snapshot (staging-only, safe to delete even on failure)
+    PHASE="cleanup_remove_config"
+    if [[ -d "${CONFIG_DIR}" ]]; then
+        log "Removing temporary config directory"
+        if ! cleanup_staging "${CONFIG_DIR}"; then
+            warn "Failed to remove temporary config directory (non-fatal)"
+        fi
+    fi
+}
+
+# =============================================================================
+# STAGING FINALIZATION
+# =============================================================================
+
+finalize_mount_and_staging() {
+    # Policy:
+    #   • If FAILED != 0 OR xferOK != 1: keep bind mount + staging for evidence
+    #   • If success AND xferOK == 1: unmount view + remove staging
+
+    if should_preserve_staging; then
+        warn "Failure detected; checking evidence preservation status"
+
+        # Report actual state of staging
+        if [[ -d "$STAGING_DIR" ]]; then
+            warn "  Staging preserved: ${STAGING_DIR}"
+        else
+            warn "  Staging not found: ${STAGING_DIR} (already removed?)"
+        fi
+
+        # Report actual state of view/mount
+        local mount_status
+        mount_status=$(findmnt -n -o SOURCE --mountpoint "$VIEW_ROOT" 2>/dev/null) || true
+        if [[ -n "$mount_status" ]]; then
+            warn "  View mounted: ${VIEW_ROOT} (source: ${mount_status})"
+        elif [[ -d "$VIEW_ROOT" ]]; then
+            warn "  View exists but not mounted: ${VIEW_ROOT}"
+        else
+            warn "  View not found: ${VIEW_ROOT}"
+        fi
+
+        return 0
+    fi
+
+    # Success path: cleanup
+    PHASE="cleanup_success"
+
+    # Remove bind mount at VIEW_ROOT (where pre-script created it)
+    remove_bind_mount "$VIEW_ROOT"
+
+    # Remove staging directory contents
+    log "Removing staging directory: ${STAGING_DIR}"
+    if ! cleanup_staging "$STAGING_DIR"; then
+        # This is unexpected on success - make it visible
+        error "Failed to remove staging directory: ${STAGING_DIR}"
+        # Don't fail the script - BackupPC transfer succeeded
+    fi
+
+    # Optional: remove empty view dir
+    rmdir "$VIEW_DIR" 2>/dev/null || true
+}
+
+# =============================================================================
+# ARTIFACT VALIDATION
+# =============================================================================
+
+validate_critical_artifacts() {
+    local errors=0
+
+    log "Validating critical artifacts"
+
+    # Database dump (REQUIRED)
+    PHASE="validate_db_dump"
+    if ! verify_zstd_file "$DB_DUMP" "Nextcloud database dump"; then
+        errors=$((errors + 1))
+    else
+        # Also verify checksum if present
+        if ! verify_file_checksum "$DB_DUMP"; then
+            errors=$((errors + 1))
+        fi
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        fail 10 "Critical artifact validation failed ($errors error(s))"
+    fi
+
+    log "Critical artifacts validated successfully"
+}
+
+validate_advisory_artifacts() {
+    PHASE="validate_advisory"
+
+    log "Checking advisory artifacts"
+
+    # Meta directory (should exist from pre-script)
+    verify_directory_exists "$META_DIR" "Backup metadata" || true
+
+    # Package lists
+    local pkg_dir="${STAGING_DIR}/package-list"
+    verify_directory_exists "$pkg_dir" "Package lists" || true
+
+    # Systemd list
+    local systemd_dir="${STAGING_DIR}/systemd-list"
+    verify_directory_exists "$systemd_dir" "Systemd services" || true
+
+    # Started timestamp from pre-script
+    local started_file="${META_DIR}/started_at"
+    if [[ -f "$started_file" ]]; then
+        local started_at
+        started_at=$(cat "$started_file")
+        debug "Backup started at: $started_at"
+    else
+        warn "Missing started_at timestamp (pre-script may have failed)"
+    fi
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    log "==== POST backup start ===="
+
+    # Initialize xferOK from BackupPC arguments
+    init_xfer_status "DumpPostUserCmd" "${1:-}" "${2:-}"
+    log "BackupPC xferOK=${XFER_OK}"
+
+    # Validate staging directory exists
+    PHASE="validate_staging"
+    if [[ ! -d "$STAGING_DIR" ]]; then
+        fail 2 "Staging directory not found: $STAGING_DIR"
+    fi
+
+    # Validate critical artifacts (fails on error)
+    validate_critical_artifacts
+
+    # Check advisory artifacts (informational)
+    validate_advisory_artifacts
+
+    PHASE="done"
+    log "Post script validation complete"
+
+    # Exit handler will finalize based on xferOK and internal status
+}
+
+# Install our custom exit handler
+trap 'post_exit_handler' EXIT
+
+# Run main with command line arguments
+main "$@"

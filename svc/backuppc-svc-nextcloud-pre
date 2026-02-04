@@ -1,0 +1,444 @@
+#!/bin/bash
+# =============================================================================
+# /usr/local/bin/backuppc-svc-nextcloud-pre
+# =============================================================================
+#
+# BackupPC pre-backup script for Nextcloud service.
+# Prepares staging directory with application-consistent backup artifacts for
+# complete disaster recovery.
+#
+# Schedule: Weekly (via BackupPC DumpPreUserCmd)
+#
+# This script:
+#   1. Enables Nextcloud maintenance mode (blocks user access during backup)
+#   2. Dumps the Nextcloud database (from central MariaDB service)
+#   3. Extracts container /etc configuration
+#   4. Captures Nextcloud app list and status
+#   5. Captures container package lists and systemd units
+#   6. Records backup metadata
+#
+# Staging structure:
+#   /export/mariadb/backuppc/services/nextcloud/
+#   ├── config/           # Container /etc extraction
+#   ├── db/               # mariadb.sql.zst (Nextcloud database dump)
+#   ├── app/              # occ-status.txt
+#   ├── app-list/         # apps.txt (installed Nextcloud apps)
+#   ├── package-list/     # pkglist-repo.txt, pkglist-aur.txt, pkg-versions.txt
+#   ├── systemd-list/     # systemd-enabled.txt
+#   └── meta/             # run_id, started_at
+#
+# Cleanup strategy:
+#   This pre-script enables maintenance mode which MUST be disabled before
+#   the script exits (success or failure). The cleanup handler ensures
+#   maintenance mode is always disabled via registered cleanup action.
+#
+# Dependencies:
+#   - common.sh library
+#   - backuppc-staging-cleanup helper
+#   - MySQL client tools (mariadb-admin, mariadb-dump)
+#   - zstd compression
+#   - incus (container management)
+#
+# Required MySQL grants for BackupOp user:
+#   GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER ON nextcloud.* TO 'BackupOp'@'...';
+#
+# Exit codes:
+#   0  - Success
+#   1  - General failure
+#   2  - Missing dependency or configuration
+#   3  - Database unreachable
+#   4  - Container error
+#   5  - Extraction/dump failure
+#   10 - Lock acquisition failed
+#   20 - Bind mount failure
+#
+# =============================================================================
+
+# Script identification (before sourcing common.sh)
+SCRIPT_NAME="backuppc-svc-nextcloud-pre"
+
+# Source shared library
+# shellcheck source=/usr/local/lib/backuppc/common.sh
+source /usr/local/lib/backuppc/common.sh
+
+# Enable comprehensive error handling
+enable_strict_traps
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Container name
+readonly APP_CT="nextcloud-server"
+
+# Database configuration
+readonly DB_HOST="minerva.nepomuc.de"
+readonly DB_NAME="nextcloud"
+readonly BACKUP_USER="BackupOp"
+
+# Staging directory structure
+readonly SERVICE_NAME="nextcloud"
+readonly STAGING_ROOT="/export/mariadb/backuppc/services"
+readonly STAGING_DIR="${STAGING_ROOT}/${SERVICE_NAME}"
+
+# BackupPC view mount point
+readonly VIEW_ROOT="/srv/backuppc/services"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
+
+# Subdirectories
+readonly CONFIG_DIR="${STAGING_DIR}/config"
+readonly DB_DIR="${STAGING_DIR}/db"
+readonly APP_DIR="${STAGING_DIR}/app"
+readonly APP_LIST_DIR="${STAGING_DIR}/app-list"
+readonly PACKAGE_DIR="${STAGING_DIR}/package-list"
+readonly SYSTEMD_DIR="${STAGING_DIR}/systemd-list"
+readonly META_DIR="${STAGING_DIR}/meta"
+
+# Paths to extract from container (relative to container root)
+readonly -a EXTRACT_PATHS=(
+    "etc"
+)
+
+# =============================================================================
+# Script-specific functions
+# =============================================================================
+
+# Disable maintenance mode cleanup action
+# This is registered as a cleanup action to ensure maintenance mode is ALWAYS
+# disabled, even on script failure.
+disable_maintenance_mode() {
+    log "Disabling Nextcloud maintenance mode"
+
+    if ! incus exec "$APP_CT" -- occ maintenance:mode --off 2>/dev/null; then
+        error "Failed to disable maintenance mode"
+        # Don't fail here - we're in cleanup, log the error but continue
+        # The script may have already failed for other reasons
+        return 1
+    fi
+
+    log "Maintenance mode disabled"
+    return 0
+}
+
+# Check database connectivity
+check_database() {
+    log "Checking database connectivity to ${DB_HOST}"
+
+    if ! mariadb-admin ping -h "$DB_HOST" --silent 2>/dev/null; then
+        fail 3 "Database host ${DB_HOST} not reachable"
+    fi
+
+    log "Database is responsive"
+}
+
+# Prepare staging directory structure
+prepare_staging() {
+    log "Preparing staging directories"
+
+    # Clean existing content using privileged helper
+    for dir in "$CONFIG_DIR" "$DB_DIR" "$APP_DIR" "$APP_LIST_DIR" "$PACKAGE_DIR" "$SYSTEMD_DIR" "$META_DIR"; do
+        if [[ -d "$dir" ]]; then
+            cleanup_staging "$dir"
+        fi
+    done
+
+    # Create directory structure
+    ensure_staging_dir "$CONFIG_DIR"
+    ensure_staging_dir "$DB_DIR"
+    ensure_staging_dir "$APP_DIR"
+    ensure_staging_dir "$APP_LIST_DIR"
+    ensure_staging_dir "$PACKAGE_DIR"
+    ensure_staging_dir "$SYSTEMD_DIR"
+    ensure_staging_dir "$META_DIR"
+
+    log "Staging directories ready"
+}
+
+# Record run metadata
+record_metadata() {
+    log "Recording backup metadata"
+
+    local run_id
+    run_id="$(date -Is | tr ':' '-')"
+
+    printf '%s\n' "$run_id" > "${META_DIR}/run_id"
+    date -Is > "${META_DIR}/started_at"
+    printf '%s\n' "$APP_CT" > "${META_DIR}/container"
+    printf '%s\n' "$DB_HOST" > "${META_DIR}/db_host"
+    printf '%s\n' "$DB_NAME" > "${META_DIR}/db_name"
+
+    log "Metadata recorded (run_id: $run_id)"
+}
+
+# Enable Nextcloud maintenance mode
+enable_maintenance_mode() {
+    log "Enabling Nextcloud maintenance mode"
+
+    if ! incus exec "$APP_CT" -- occ maintenance:mode --on; then
+        fail 4 "Failed to enable maintenance mode"
+    fi
+
+    # Register cleanup action to disable maintenance mode on exit
+    # This ensures maintenance mode is ALWAYS disabled, even on failure
+    register_cleanup "disable_maintenance_mode"
+
+    log "Maintenance mode enabled"
+}
+
+# Dump Nextcloud database
+dump_database() {
+    PHASE="db_dump"
+    log "Dumping Nextcloud database"
+
+    timer_start "db_dump"
+
+    local dump_errors
+    dump_errors=$(mktemp) || fail 5 "Failed to create temp file for error capture"
+    register_cleanup "rm -f '$dump_errors'"
+
+    local db_file="${DB_DIR}/mariadb.sql.zst"
+
+    if ! mariadb-dump \
+        --single-transaction \
+        --routines \
+        --events \
+        --triggers \
+        -h "$DB_HOST" \
+        -u "$BACKUP_USER" \
+        "$DB_NAME" 2>"$dump_errors" \
+        | zstd -19 -T0 > "$db_file"; then
+
+        if [[ -s "$dump_errors" ]]; then
+            error "mariadb-dump stderr:"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$dump_errors"
+        fi
+        fail 5 "Failed to dump Nextcloud database"
+    fi
+
+    # Check for warnings even on success
+    if [[ -s "$dump_errors" ]]; then
+        warn "mariadb-dump produced warnings:"
+        while IFS= read -r line; do
+            warn "  $line"
+        done < "$dump_errors"
+    fi
+
+    # Generate checksum
+    (cd "$DB_DIR" && sha256sum -b "mariadb.sql.zst" > "mariadb.sql.zst.sha256")
+
+    timer_log "db_dump" "Database dump completed"
+}
+
+# Extract container configuration
+extract_config() {
+    PHASE="extract_config"
+    log "Extracting container configuration"
+
+    # Build list of paths that exist
+    local -a paths_to_extract=()
+    for path in "${EXTRACT_PATHS[@]}"; do
+        if incus exec "$APP_CT" -- test -e "/$path" 2>/dev/null; then
+            paths_to_extract+=("$path")
+        else
+            warn "Path not found in container, skipping: /$path"
+        fi
+    done
+
+    if [[ ${#paths_to_extract[@]} -eq 0 ]]; then
+        fail 5 "No configuration paths found in container"
+    fi
+
+    # Clean old extracted folder before extracting
+    sudo backuppc-staging-cleanup "$CONFIG_DIR"
+
+    # Extract each path
+    for path in "${paths_to_extract[@]}"; do
+        log_indent "Extracting: /${path}"
+        extract_container_path "$APP_CT" "$path" "$CONFIG_DIR"
+    done
+
+    log "Configuration extraction complete"
+}
+
+# Capture Nextcloud app list
+capture_app_list() {
+    PHASE="nc_app_list_dump"
+    log "Capturing Nextcloud app list"
+
+    local app_list_file="${APP_LIST_DIR}/apps.txt"
+
+    if ! incus exec "$APP_CT" -- occ app:list > "$app_list_file" 2>/dev/null; then
+        warn "Failed to capture Nextcloud app list"
+        return 1
+    fi
+
+    local enabled_count disabled_count
+    enabled_count=$(grep -c "^  - " "$app_list_file" 2>/dev/null || echo "0")
+    log_indent "Apps captured: ${enabled_count} entries"
+}
+
+# Capture Nextcloud status
+capture_nextcloud_status() {
+    PHASE="nc_state_dump"
+    log "Capturing Nextcloud status"
+
+    local status_file="${APP_DIR}/occ-status.txt"
+
+    if ! incus exec "$APP_CT" -- occ status > "$status_file" 2>/dev/null; then
+        warn "Failed to capture Nextcloud status"
+        return 1
+    fi
+
+    log "Nextcloud status captured"
+}
+
+# Capture systemd enabled services
+capture_systemd_units() {
+    PHASE="systemd_service_dump"
+    log "Capturing systemd enabled services"
+
+    if ! incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled \
+        > "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null; then
+        warn "Failed to capture systemd unit list"
+        return 1
+    fi
+
+    local unit_count
+    unit_count=$(grep -c "enabled" "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null || echo "0")
+    log_indent "Enabled units: ${unit_count}"
+}
+
+# Generate summary report
+generate_summary() {
+    PHASE="summary"
+    log "Generating backup summary"
+
+    log "=== Backup Summary ==="
+    log "Staging directory: ${STAGING_DIR}"
+    log "View directory:    ${VIEW_DIR}"
+    log "Container:         ${APP_CT}"
+    log "Database:          ${DB_NAME}@${DB_HOST}"
+
+    if [[ -f "${DB_DIR}/mariadb.sql.zst" ]]; then
+        log_indent "mariadb.sql.zst: $(du -h "${DB_DIR}/mariadb.sql.zst" | cut -f1)"
+    fi
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local file_list=""
+        local file_count=0
+        local restricted_dirs=""
+        local restricted_dir_count=0
+
+        file_list=$(find "$CONFIG_DIR" -type f 2>/dev/null || true)
+        restricted_dirs=$(find "$CONFIG_DIR" -type d ! -readable 2>/dev/null || true)
+
+        if [[ -n "$file_list" ]]; then
+            file_count=$(wc -l <<< "$file_list")
+        fi
+        if [[ -n "$restricted_dirs" ]]; then
+            restricted_dir_count=$(wc -l <<< "$restricted_dirs")
+        fi
+
+        if [[ $restricted_dir_count -gt 0 ]]; then
+            log_indent "Config files: ${file_count}+ (${restricted_dir_count} restricted dirs)"
+        else
+            log_indent "Config files: ${file_count}"
+        fi
+    fi
+
+    if [[ -f "${APP_LIST_DIR}/apps.txt" ]]; then
+        local app_count
+        app_count=$(grep -c "^  - " "${APP_LIST_DIR}/apps.txt" 2>/dev/null || echo "0")
+        log_indent "Nextcloud apps: ${app_count}"
+    fi
+
+    if [[ -f "${PACKAGE_DIR}/pkglist-repo.txt" ]]; then
+        local pkg_count
+        pkg_count=$(wc -l < "${PACKAGE_DIR}/pkglist-repo.txt" 2>/dev/null || echo "0")
+        log_indent "Installed packages: ${pkg_count}"
+    fi
+
+    if [[ -f "${SYSTEMD_DIR}/systemd-enabled.txt" ]]; then
+        local service_count timer_count
+        service_count=$(grep -c '\.service' "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null || echo "0")
+        timer_count=$(grep -c '\.timer' "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null || echo "0")
+        log_indent "Enabled services: ${service_count}"
+        log_indent "Enabled timers:   ${timer_count}" "    "
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    log "==== ${SCRIPT_NAME} started ===="
+    timer_start "total"
+
+    # Acquire exclusive lock
+    acquire_lock
+
+    # Validate prerequisites
+    PHASE="validate"
+    require_command mariadb-admin
+    require_command mariadb-dump
+    require_command zstd
+    require_command incus
+    require_command sha256sum
+
+    # Check container is running
+    require_running_container "$APP_CT"
+
+    # Validate container has required commands
+    require_container_command "$APP_CT" occ
+    require_container_command "$APP_CT" pacman
+    require_container_command "$APP_CT" systemctl
+
+    # Check database connectivity
+    check_database
+
+    # Prepare staging directories
+    PHASE="prepare"
+    prepare_staging
+
+    # Record metadata early
+    record_metadata
+
+    # Ensure bind mount exists for BackupPC view
+    PHASE="bind_mount_prepare"
+    ensure_bind_mount "$STAGING_ROOT" "$VIEW_ROOT"
+
+    # Enable maintenance mode (cleanup will disable it on exit)
+    PHASE="maintenance_on"
+    enable_maintenance_mode
+
+    # Dump database
+    dump_database
+
+    # Extract container configuration
+    extract_config
+
+    # Capture Nextcloud app list
+    capture_app_list
+
+    # Capture Nextcloud status
+    capture_nextcloud_status
+
+    # Capture package lists
+    PHASE="package_list_dump"
+    capture_container_package_lists "$APP_CT" "$PACKAGE_DIR"
+
+    # Capture systemd units
+    capture_systemd_units
+
+    # Summary
+    generate_summary
+
+    timer_log "total" "Pre-backup completed"
+
+    # Exit handled by on_exit trap (which runs cleanup including disable_maintenance_mode)
+}
+
+main "$@"
