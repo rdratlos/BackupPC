@@ -1,114 +1,569 @@
 #!/bin/bash
 # =============================================================================
-# /usr/local/sbin/backuppc-svc-example-pre
+# /usr/local/sbin/backuppc-svc-<SERVICE>-pre
 # =============================================================================
 #
-# Example pre-backup script demonstrating common.sh usage.
-# This is a template - adapt for your specific service.
+# BackupPC pre-backup script for <SERVICE> service.
+# Prepares staging directory with application-consistent backup artifacts for
+# complete disaster recovery.
 #
-# Called by BackupPC as DumpPreUserCmd:
-#   $Conf{DumpPreUserCmd} = '/usr/local/sbin/backuppc-svc-example-pre $host';
+# Schedule: <FREQUENCY> (via BackupPC DumpPreUserCmd)
+#
+# -----------------------------------------------------------------------------
+# TEMPLATE CUSTOMIZATION GUIDE
+# -----------------------------------------------------------------------------
+# This is a template for creating service-specific pre-backup scripts.
+# Search for "<" to find all customization points.
+#
+# Required customizations:
+#   1. SCRIPT_NAME      - Script identifier (line ~58)
+#   2. APP_CT           - Container name (line ~72)
+#   3. SERVICE_NAME     - Service identifier (line ~80)
+#   4. Subdirectories   - Uncomment/add as needed (lines ~88-96)
+#   5. EXTRACT_PATHS    - Paths to extract from container (line ~101)
+#   6. prepare_staging  - Update directory list (line ~160)
+#   7. main()           - Uncomment/add service-specific steps
+#
+# Optional customizations:
+#   - Database configuration (DB_HOST, DB_NAME, etc.)
+#   - Cleanup actions (maintenance mode, service stops)
+#   - Application state capture functions
+#   - Summary report additions
+#
+# Reference implementations:
+#   - backuppc-svc-mariadb-pre   (database service with binlog handling)
+#   - backuppc-svc-nextcloud-pre (web app with maintenance mode)
+#
+# -----------------------------------------------------------------------------
+#
+# This script:
+#   1. <STEP 1 - e.g., Enables maintenance mode / Stops service>
+#   2. <STEP 2 - e.g., Dumps database>
+#   3. Extracts container configuration
+#   4. <STEP 4 - e.g., Captures application state>
+#   5. Captures container package lists and systemd units
+#   6. Records backup metadata
+#
+# Staging structure:
+#   /export/mariadb/backuppc/services/<SERVICE>/
+#   ├── config/           # Container /etc extraction (or specific paths)
+#   ├── db/               # Database dumps (if applicable)
+#   ├── app/              # Application state (if applicable)
+#   ├── app-list/         # Application plugins/extensions list
+#   ├── package-list/     # pkglist-repo.txt, pkglist-aur.txt, pkg-versions.txt
+#   ├── systemd-list/     # systemd-enabled.txt
+#   └── meta/             # run_id, started_at, container, db_host, db_name
+#
+# Cleanup strategy:
+#   <DESCRIBE CLEANUP - e.g., "This pre-script enables maintenance mode which
+#   MUST be disabled before exit. The cleanup handler ensures this via
+#   registered cleanup action.">
+#
+# Dependencies:
+#   - common.sh library
+#   - backuppc-staging-cleanup helper
+#   - <SERVICE-SPECIFIC TOOLS - e.g., mariadb-dump, zstd>
+#   - incus (container management)
 #
 # Exit codes:
 #   0  - Success
-#   1  - General error
-#   2  - Configuration/validation error
-#   3  - Staging operation failed
-#   4  - Container operation failed
-#   5  - Timeout
+#   1  - General failure
+#   2  - Missing dependency or configuration
+#   3  - Database unreachable (if applicable)
+#   4  - Container error
+#   5  - Extraction/dump failure
 #   10 - Lock acquisition failed
+#   20 - Bind mount failure
 #
 # =============================================================================
 
+# Script identification (before sourcing common.sh)
+SCRIPT_NAME="backuppc-svc-<SERVICE>-pre"
+
 # Source shared library
+# shellcheck source=/usr/local/lib/backuppc/common.sh
 source /usr/local/lib/backuppc/common.sh
+
+# Enable comprehensive error handling
 enable_strict_traps
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Configuration
-# -----------------------------------------------------------------------------
-SERVICE="example"
-CONTAINER="ct-${SERVICE}"
-STAGING_ROOT="/srv/backuppc-staging"
-STAGING_DIR="${STAGING_ROOT}/${SERVICE}"
+# =============================================================================
 
-# Paths to extract from container (relative to /, no leading slash)
-EXTRACT_PATHS=(
-    "etc/${SERVICE}"
-    "var/lib/${SERVICE}/config"
+# -----------------------------------------------------------------------------
+# Container Configuration
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION REQUIRED: Set your container name
+readonly APP_CT="<container-name>"
+
+# -----------------------------------------------------------------------------
+# Database Configuration (if applicable)
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Uncomment and configure if service has a database
+# readonly DB_HOST="<hostname>"
+# readonly DB_NAME="<database>"
+# readonly BACKUP_USER="<mysql-user>"
+
+# -----------------------------------------------------------------------------
+# Staging Directory Configuration
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION REQUIRED: Set service name for staging paths
+readonly SERVICE_NAME="<service>"
+
+# Root directories for staging and BackupPC view
+readonly STAGING_ROOT="/export/mariadb/backuppc/services"
+readonly STAGING_DIR="${STAGING_ROOT}/${SERVICE_NAME}"
+
+# BackupPC view mount point (bind-mounted from staging)
+readonly VIEW_ROOT="/srv/backuppc/services"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
+
+# -----------------------------------------------------------------------------
+# Staging Subdirectories
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Uncomment directories your service needs
+readonly CONFIG_DIR="${STAGING_DIR}/config"
+readonly META_DIR="${STAGING_DIR}/meta"
+readonly PACKAGE_DIR="${STAGING_DIR}/package-list"
+readonly SYSTEMD_DIR="${STAGING_DIR}/systemd-list"
+# readonly DB_DIR="${STAGING_DIR}/db"
+# readonly APP_DIR="${STAGING_DIR}/app"
+# readonly APP_LIST_DIR="${STAGING_DIR}/app-list"
+
+# -----------------------------------------------------------------------------
+# Container Paths to Extract
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Paths to extract from container (relative to /).
+# Options:
+#   - "etc" - Entire /etc directory
+#   - Specific paths: "etc/myapp", "etc/myapp.conf", "etc/ssl"
+readonly -a EXTRACT_PATHS=(
+    "etc"
+    # Or be specific:
+    # "etc/myapp"
+    # "etc/myapp.conf"
+    # "etc/ssl"
 )
 
-# -----------------------------------------------------------------------------
-# Service-specific cleanup
-# -----------------------------------------------------------------------------
-# Called automatically on exit (success or failure)
-# Can check $FAILED to determine if rollback is needed
+# =============================================================================
+# Service-Specific Functions
+# =============================================================================
 
-cleanup_service() {
-    if [[ "$FAILED" -ne 0 ]]; then
-        warn "Cleaning up after failure in phase: ${FAIL_PHASE:-unknown}"
-        # Add rollback logic here if needed, e.g.:
-        # - Re-enable services that were stopped
-        # - Remove partial staging data
-        # - Restore container state
-    fi
+# -----------------------------------------------------------------------------
+# Cleanup Action: Disable Maintenance Mode
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Implement if service needs cleanup on exit.
+# Registered via register_cleanup() to ensure it ALWAYS runs.
+#
+# disable_maintenance_mode() {
+#     log "Disabling ${SERVICE_NAME} maintenance mode"
+#
+#     if ! incus exec "$APP_CT" -- <app-cli> maintenance:mode --off 2>/dev/null; then
+#         error "Failed to disable maintenance mode"
+#         return 1
+#     fi
+#
+#     log "Maintenance mode disabled"
+#     return 0
+# }
+
+# -----------------------------------------------------------------------------
+# Enable Maintenance Mode
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Implement if service requires quiescence before backup.
+#
+# enable_maintenance_mode() {
+#     log "Enabling ${SERVICE_NAME} maintenance mode"
+#
+#     if ! incus exec "$APP_CT" -- <app-cli> maintenance:mode --on; then
+#         fail 4 "Failed to enable maintenance mode"
+#     fi
+#
+#     # Register cleanup to disable on exit (success or failure)
+#     register_cleanup "disable_maintenance_mode"
+#
+#     log "Maintenance mode enabled"
+# }
+
+# -----------------------------------------------------------------------------
+# Check Database Connectivity
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Implement if service has a database.
+#
+# check_database() {
+#     log "Checking database connectivity to ${DB_HOST}"
+#
+#     if ! mariadb-admin ping -h "$DB_HOST" --silent 2>/dev/null; then
+#         fail 3 "Database host ${DB_HOST} not reachable"
+#     fi
+#
+#     log "Database is responsive"
+# }
+
+# -----------------------------------------------------------------------------
+# Prepare Staging Directory Structure
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Update directory list to match your service.
+prepare_staging() {
+    log "Preparing staging directories"
+
+    # Clean existing content using privileged helper
+    # CUSTOMIZATION: Add all directories your service uses
+    for dir in "$CONFIG_DIR" "$META_DIR" "$PACKAGE_DIR" "$SYSTEMD_DIR"; do
+        if [[ -d "$dir" ]]; then
+            cleanup_staging "$dir"
+        fi
+    done
+    # Uncomment as needed:
+    # for dir in "$DB_DIR" "$APP_DIR" "$APP_LIST_DIR"; do
+    #     if [[ -d "$dir" ]]; then
+    #         cleanup_staging "$dir"
+    #     fi
+    # done
+
+    # Create directory structure
+    # CUSTOMIZATION: Add all directories your service uses
+    ensure_staging_dir "$CONFIG_DIR"
+    ensure_staging_dir "$META_DIR"
+    ensure_staging_dir "$PACKAGE_DIR"
+    ensure_staging_dir "$SYSTEMD_DIR"
+    # Uncomment as needed:
+    # ensure_staging_dir "$DB_DIR"
+    # ensure_staging_dir "$APP_DIR"
+    # ensure_staging_dir "$APP_LIST_DIR"
+
+    log "Staging directories ready"
 }
 
 # -----------------------------------------------------------------------------
-# Main
+# Record Backup Metadata
 # -----------------------------------------------------------------------------
-main() {
-    timer_start "total"
-    PHASE="init"
+# CUSTOMIZATION: Add service-specific metadata fields.
+record_metadata() {
+    log "Recording backup metadata"
 
-    # Register cleanup early so it runs even on early failures
-    register_cleanup "cleanup_service"
+    local run_id
+    run_id="$(date -Is | tr ':' '-')"
 
-    # Validate environment
-    PHASE="validation"
-    require_command incus
-    require_directory "$STAGING_ROOT"
+    printf '%s\n' "$run_id" > "${META_DIR}/run_id"
+    date -Is > "${META_DIR}/started_at"
+    printf '%s\n' "$APP_CT" > "${META_DIR}/container"
 
-    # Prevent concurrent runs
-    PHASE="locking"
-    acquire_lock "$SERVICE"
+    # CUSTOMIZATION: Add database metadata if applicable
+    # printf '%s\n' "$DB_HOST" > "${META_DIR}/db_host"
+    # printf '%s\n' "$DB_NAME" > "${META_DIR}/db_name"
 
-    # Verify container exists and is running
-    PHASE="container_check"
-    if ! container_exists "$CONTAINER"; then
-        fail 4 "Container does not exist: $CONTAINER"
-    fi
+    log "Metadata recorded (run_id: $run_id)"
+}
 
-    if ! container_running "$CONTAINER"; then
-        warn "Container not running: $CONTAINER - starting it"
-        incus start "$CONTAINER"
-        wait_container_ready "$CONTAINER" 60
-    fi
+# -----------------------------------------------------------------------------
+# Dump Database
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Implement if service has a database.
+#
+# dump_database() {
+#     PHASE="db_dump"
+#     log "Dumping database"
+#
+#     timer_start "db_dump"
+#
+#     local dump_errors
+#     dump_errors=$(mktemp) || fail 5 "Failed to create temp file for error capture"
+#     register_cleanup "rm -f '$dump_errors'"
+#
+#     local db_file="${DB_DIR}/mariadb.sql.zst"
+#
+#     if ! mariadb-dump \
+#         --single-transaction \
+#         --routines \
+#         --events \
+#         --triggers \
+#         -h "$DB_HOST" \
+#         -u "$BACKUP_USER" \
+#         "$DB_NAME" 2>"$dump_errors" \
+#         | zstd -19 -T0 > "$db_file"; then
+#
+#         if [[ -s "$dump_errors" ]]; then
+#             error "mariadb-dump stderr:"
+#             while IFS= read -r line; do
+#                 error "  $line"
+#             done < "$dump_errors"
+#         fi
+#         fail 5 "Failed to dump database"
+#     fi
+#
+#     # Check for warnings even on success
+#     if [[ -s "$dump_errors" ]]; then
+#         warn "mariadb-dump produced warnings:"
+#         while IFS= read -r line; do
+#             warn "  $line"
+#         done < "$dump_errors"
+#     fi
+#
+#     # Generate checksum
+#     (cd "$DB_DIR" && sha256sum -b "mariadb.sql.zst" > "mariadb.sql.zst.sha256")
+#
+#     timer_log "db_dump" "Database dump completed"
+# }
 
-    # Clean staging area
-    PHASE="staging_cleanup"
-    cleanup_staging "$STAGING_DIR"
+# -----------------------------------------------------------------------------
+# Extract Container Configuration
+# -----------------------------------------------------------------------------
+extract_config() {
+    PHASE="extract_config"
+    log "Extracting container configuration"
 
-    # Extract paths from container
-    PHASE="extraction"
+    # Build list of paths that exist
+    local -a paths_to_extract=()
     for path in "${EXTRACT_PATHS[@]}"; do
-        # Determine destination subdirectory (preserve structure)
-        local dest_subdir
-        dest_subdir=$(dirname "$path" | tr '/' '-')
-        [[ "$dest_subdir" == "." ]] && dest_subdir=""
-
-        local dest="${STAGING_DIR}/${dest_subdir}"
-        ensure_staging_dir "$dest"
-
-        timer_start "extract_${path}"
-        extract_container_path "$CONTAINER" "$path" "$dest"
-        timer_log "extract_${path}" "Extracted ${path}"
+        if incus exec "$APP_CT" -- test -e "/$path" 2>/dev/null; then
+            paths_to_extract+=("$path")
+        else
+            warn "Path not found in container, skipping: /$path"
+        fi
     done
 
-    PHASE="complete"
-    timer_log "total" "Pre-backup for ${SERVICE}"
-    log "Staging directory ready: $STAGING_DIR"
+    if [[ ${#paths_to_extract[@]} -eq 0 ]]; then
+        fail 5 "No configuration paths found in container"
+    fi
+
+    # Clean old extracted folder before extracting
+    sudo backuppc-staging-cleanup "$CONFIG_DIR"
+
+    # Extract each path (preserves ownership via tarRestore)
+    for path in "${paths_to_extract[@]}"; do
+        log_indent "Extracting: /${path}"
+        extract_container_path "$APP_CT" "$path" "$CONFIG_DIR"
+    done
+
+    log "Configuration extraction complete"
 }
 
-# Run main function
+# -----------------------------------------------------------------------------
+# Capture Application State
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Implement for applications with CLI status tools.
+# Examples: Nextcloud occ, WordPress wp-cli, Mattermost mmctl
+#
+# capture_app_status() {
+#     PHASE="app_status"
+#     log "Capturing application status"
+#
+#     local status_file="${APP_DIR}/status.txt"
+#
+#     if ! incus exec "$APP_CT" -- <app-cli> status > "$status_file" 2>/dev/null; then
+#         warn "Failed to capture application status"
+#         return 1
+#     fi
+#
+#     log "Application status captured"
+# }
+
+# -----------------------------------------------------------------------------
+# Capture Application Plugin/Extension List
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Implement for applications with plugins/extensions.
+# Examples: Nextcloud apps, WordPress plugins, browser extensions
+#
+# capture_app_list() {
+#     PHASE="app_list"
+#     log "Capturing application plugin list"
+#
+#     local app_list_file="${APP_LIST_DIR}/plugins.txt"
+#
+#     if ! incus exec "$APP_CT" -- <app-cli> plugin:list > "$app_list_file" 2>/dev/null; then
+#         warn "Failed to capture plugin list"
+#         return 1
+#     fi
+#
+#     local count
+#     count=$(wc -l < "$app_list_file" 2>/dev/null || echo "0")
+#     log_indent "Plugins captured: ${count} entries"
+# }
+
+# -----------------------------------------------------------------------------
+# Capture Systemd Units
+# -----------------------------------------------------------------------------
+capture_systemd_units() {
+    PHASE="systemd_service_dump"
+    log "Capturing systemd enabled services"
+
+    if ! incus exec "$APP_CT" -- systemctl list-unit-files --state=enabled \
+        > "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null; then
+        warn "Failed to capture systemd unit list"
+        return 1
+    fi
+
+    local unit_count
+    unit_count=$(grep -c "enabled" "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null || echo "0")
+    log_indent "Enabled units: ${unit_count}"
+}
+
+# -----------------------------------------------------------------------------
+# Generate Backup Summary
+# -----------------------------------------------------------------------------
+# Produces human-readable summary for logs and diagnostics.
+# CUSTOMIZATION: Add service-specific summary items.
+generate_summary() {
+    PHASE="summary"
+    log "Generating backup summary"
+
+    log "=== Backup Summary ==="
+    log "Staging directory: ${STAGING_DIR}"
+    log "View directory:    ${VIEW_DIR}"
+    log "Container:         ${APP_CT}"
+
+    # CUSTOMIZATION: Add database info if applicable
+    # log "Database:          ${DB_NAME}@${DB_HOST}"
+
+    # CUSTOMIZATION: Add database dump size
+    # if [[ -f "${DB_DIR}/mariadb.sql.zst" ]]; then
+    #     log_indent "mariadb.sql.zst: $(du -h "${DB_DIR}/mariadb.sql.zst" | cut -f1)"
+    # fi
+
+    # Config directory stats
+    if [[ -d "$CONFIG_DIR" ]]; then
+        local file_list=""
+        local file_count=0
+        local restricted_dirs=""
+        local restricted_dir_count=0
+
+        file_list=$(find "$CONFIG_DIR" -type f 2>/dev/null || true)
+        restricted_dirs=$(find "$CONFIG_DIR" -type d ! -readable 2>/dev/null || true)
+
+        if [[ -n "$file_list" ]]; then
+            file_count=$(wc -l <<< "$file_list")
+        fi
+        if [[ -n "$restricted_dirs" ]]; then
+            restricted_dir_count=$(wc -l <<< "$restricted_dirs")
+        fi
+
+        if [[ $restricted_dir_count -gt 0 ]]; then
+            log_indent "Config files: ${file_count}+ (${restricted_dir_count} restricted dirs)"
+        else
+            log_indent "Config files: ${file_count}"
+        fi
+    fi
+
+    # CUSTOMIZATION: Add app-specific stats
+    # if [[ -f "${APP_LIST_DIR}/plugins.txt" ]]; then
+    #     local plugin_count
+    #     plugin_count=$(wc -l < "${APP_LIST_DIR}/plugins.txt" 2>/dev/null || echo "0")
+    #     log_indent "Plugins: ${plugin_count}"
+    # fi
+
+    # Package list stats
+    if [[ -f "${PACKAGE_DIR}/pkglist-repo.txt" ]]; then
+        local pkg_count
+        pkg_count=$(wc -l < "${PACKAGE_DIR}/pkglist-repo.txt" 2>/dev/null || echo "0")
+        log_indent "Installed packages: ${pkg_count}"
+    fi
+
+    # Systemd unit stats
+    if [[ -f "${SYSTEMD_DIR}/systemd-enabled.txt" ]]; then
+        local service_count timer_count
+        service_count=$(grep -c '\.service' "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null || echo "0")
+        timer_count=$(grep -c '\.timer' "${SYSTEMD_DIR}/systemd-enabled.txt" 2>/dev/null || echo "0")
+        log_indent "Enabled services: ${service_count}"
+        log_indent "Enabled timers:   ${timer_count}" "    "
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+main() {
+    log "==== ${SCRIPT_NAME} started ===="
+    timer_start "total"
+
+    # -------------------------------------------------------------------------
+    # Phase: Lock Acquisition
+    # -------------------------------------------------------------------------
+    acquire_lock
+
+    # -------------------------------------------------------------------------
+    # Phase: Prerequisite Validation
+    # -------------------------------------------------------------------------
+    PHASE="validate"
+
+    # Required commands (host)
+    require_command incus
+    require_command sha256sum
+    # CUSTOMIZATION: Add service-specific requirements
+    # require_command mariadb-admin
+    # require_command mariadb-dump
+    # require_command zstd
+
+    # Container validation
+    require_running_container "$APP_CT"
+
+    # Container commands
+    # CUSTOMIZATION: Add commands your service needs
+    require_container_command "$APP_CT" systemctl
+    # require_container_command "$APP_CT" pacman      # For Arch/Manjaro
+    # require_container_command "$APP_CT" <app-cli>   # e.g., occ for Nextcloud
+
+    # CUSTOMIZATION: Database connectivity check (if applicable)
+    # check_database
+
+    # -------------------------------------------------------------------------
+    # Phase: Staging Preparation
+    # -------------------------------------------------------------------------
+    PHASE="prepare"
+    prepare_staging
+    record_metadata
+
+    # -------------------------------------------------------------------------
+    # Phase: Bind Mount Setup
+    # -------------------------------------------------------------------------
+    PHASE="bind_mount_prepare"
+    ensure_bind_mount "$STAGING_ROOT" "$VIEW_ROOT"
+
+    # -------------------------------------------------------------------------
+    # Phase: Service Quiescence (if applicable)
+    # -------------------------------------------------------------------------
+    # CUSTOMIZATION: Enable maintenance mode, stop services, etc.
+    # PHASE="maintenance_on"
+    # enable_maintenance_mode
+
+    # -------------------------------------------------------------------------
+    # Phase: Database Dump (if applicable)
+    # -------------------------------------------------------------------------
+    # CUSTOMIZATION: Dump database if service has one
+    # dump_database
+
+    # -------------------------------------------------------------------------
+    # Phase: Configuration Extraction
+    # -------------------------------------------------------------------------
+    extract_config
+
+    # -------------------------------------------------------------------------
+    # Phase: Application State Capture (if applicable)
+    # -------------------------------------------------------------------------
+    # CUSTOMIZATION: Capture application-specific state
+    # capture_app_status
+    # capture_app_list
+
+    # -------------------------------------------------------------------------
+    # Phase: Package List Capture
+    # -------------------------------------------------------------------------
+    PHASE="package_list_dump"
+    capture_container_package_lists "$APP_CT" "$PACKAGE_DIR"
+
+    # -------------------------------------------------------------------------
+    # Phase: Systemd Unit Capture
+    # -------------------------------------------------------------------------
+    capture_systemd_units
+
+    # -------------------------------------------------------------------------
+    # Phase: Summary
+    # -------------------------------------------------------------------------
+    generate_summary
+
+    timer_log "total" "Pre-backup completed"
+
+    # Exit handled by on_exit trap (which runs registered cleanup actions)
+}
+
 main "$@"
