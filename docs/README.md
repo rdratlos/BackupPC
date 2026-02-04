@@ -31,25 +31,24 @@ The [templates/](templates/) directory contains annotated script templates for c
 ### Script Lifecycle
 
 ```
-BackupPC                    Pre-Script                  BackupPC                    Post-Script
-────────────────────────────────────────────────────────────────────────────────────────────────
-DumpPreUserCmd ────────────▶ acquire_lock
-                             prepare_staging
-                             ensure_bind_mount
-                             enable_maintenance_mode
-                             dump_database
-                             extract_config
-                             capture_package_lists
-                             generate_summary
-                             ◀──────────────────────────
-                             (cleanup: disable maint.)
-                                                        rsync staging ──────────────────────────▶
-                                                        ◀────────────── (xferOK=0|1) ───────────
-DumpPostUserCmd ───────────────────────────────────────────────────────▶ init_xfer_status
-                                                                         validate_artifacts
-                                                                         write_meta_status
-                                                                         remove_bind_mount
-                                                                         cleanup_if_success
+BackupPC                  Pre-Script                    BackupPC                         Post-Script
+───────────────────────────────────────────────────────────────────────────────────────────────────────────
+DumpPreUserCmd ────────▶ acquire_lock
+                          prepare_staging
+                          ensure_bind_mount
+                          enable_maintenance_mode
+                          dump_database
+                          extract_config
+                          capture_package_lists
+                          generate_summary
+                          exit 0 (success) ──────────▶ rsync/tar staging view
+                          (cleanup: disable maint.)     to BackupPC pool
+
+                                                        DumpPostUserCmd ─(xferOK=0|1)─▶ init_xfer_status
+                                                                                         validate_artifacts
+                                                                                         write_meta_status
+                                                                                         remove_bind_mount
+                                                                                         cleanup_if_success
 ```
 
 ### Exit Code Summary
