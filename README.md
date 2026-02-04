@@ -21,6 +21,9 @@ This suite extends [BackupPC](https://backuppc.github.io/backuppc/) beyond tradi
 │   │  rsync/tar  │     │  │ ├─config/        │◀───│──│ • /etc              ││ │
 │   │  pooling    │     │  │ ├─db/            │     │  │ • occ status        ││ │
 │   └─────────────┘     │  │ └─meta/          │     │  └─────────────────────┘│ │
+│         │             │  ├─digikam/         │     │                         │ │
+│         │             │  │ ├─db/            │     │                         │ │
+│         │             │  │ └─meta/          │     │                         │ │
 │         │             │  └─mariadb/         │     │  ┌─────────────────────┐│ │
 │         │             │    ├─server/        │◀───│──│ minerva (MariaDB)   ││ │
 │         ▼             │    │ └─db/binlogs   │     │  │ • mysql.* dump      ││ │
@@ -76,6 +79,8 @@ backuppc-services/
 ├── svc/                          # Service backup scripts
 │   ├── backuppc-svc-nextcloud-pre
 │   ├── backuppc-svc-nextcloud-post
+│   ├── backuppc-svc-digikam-pre
+│   ├── backuppc-svc-digikam-post
 │   ├── backuppc-svc-mariadb-pre
 │   └── backuppc-svc-mariadb-post
 ├── etc/backuppc/                 # Configuration templates
@@ -102,6 +107,7 @@ backuppc-services/
 | Service | Pre-Script | Post-Script | Features |
 |---------|-----------|-------------|----------|
 | **Nextcloud** | `backuppc-svc-nextcloud-pre` | `backuppc-svc-nextcloud-post` | Maintenance mode, database dump, app list, config extraction |
+| **Digikam** | `backuppc-svc-digikam-pre` | `backuppc-svc-digikam-post` | Database dump |
 | **MariaDB** | `backuppc-svc-mariadb-pre` | `backuppc-svc-mariadb-post` | Binary log flush, mysql.* dump, PITR support, grant export |
 
 ## Staging Structure
