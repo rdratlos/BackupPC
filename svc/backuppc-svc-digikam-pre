@@ -1,0 +1,265 @@
+#!/bin/bash
+# =============================================================================
+# Digikam Service Backup — Pre-Hook for BackupPC
+# /usr/local/sbin/backuppc-svc-digikam-pre
+# =============================================================================
+#
+# BackupPC pre-backup script for Digikam service.
+# Prepares staging directory with application-consistent backup artifacts for
+# complete disaster recovery.
+#
+# Schedule: Weekly (via BackupPC DumpPreUserCmd)
+#
+# This script:
+#   1. Dumps the Digikam database (from central MariaDB service)
+#   2. Records backup metadata
+#
+# Staging structure:
+#   /export/mariadb/backuppc/services/digikam/
+#   ├── db/               # mariadb.sql.zst (Digikam database dump)
+#   └── meta/             # run_id, started_at
+#
+# Dependencies:
+#   - common.sh library
+#   - backuppc-staging-cleanup helper
+#   - MySQL client tools (mariadb-admin, mariadb-dump)
+#   - zstd compression
+#   - incus (container management)
+#
+# Required MySQL grants for BackupOp user:
+#   GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER ON digikam.* TO 'BackupOp'@'...';
+#
+# Exit codes:
+#   0  - Success
+#   1  - General failure
+#   2  - Missing dependency or configuration
+#   3  - Database unreachable
+#   4  - Container error
+#   5  - Extraction/dump failure
+#   10 - Lock acquisition failed
+#   20 - Bind mount failure
+#
+# =============================================================================
+
+# Script identification (before sourcing common.sh)
+SCRIPT_NAME="backuppc-svc-digikam-pre"
+
+# Source shared library
+# shellcheck source=/usr/local/lib/backuppc/common.sh
+source /usr/local/lib/backuppc/common.sh
+
+# Enable comprehensive error handling
+enable_strict_traps
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Database Configuration
+# -----------------------------------------------------------------------------
+readonly DB_HOST="digikam.nepomuc.de"
+readonly DB_NAME="digikam"
+readonly BACKUP_USER="BackupOp"
+
+# -----------------------------------------------------------------------------
+# Staging Directory Configuration
+# -----------------------------------------------------------------------------
+readonly SERVICE_NAME="digikam"
+
+# Root directories for staging and BackupPC view
+readonly STAGING_ROOT="/export/mariadb/backuppc/services"
+readonly STAGING_DIR="${STAGING_ROOT}/${SERVICE_NAME}"
+
+# BackupPC view mount point (bind-mounted from staging)
+readonly VIEW_ROOT="/srv/backuppc/services"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE_NAME}"
+
+# -----------------------------------------------------------------------------
+# Staging Subdirectories
+# -----------------------------------------------------------------------------
+readonly META_DIR="${STAGING_DIR}/meta"
+readonly DB_DIR="${STAGING_DIR}/db"
+
+# -----------------------------------------------------------------------------
+# Check Database Connectivity
+# -----------------------------------------------------------------------------
+check_database() {
+    log "Checking database connectivity to ${DB_HOST}"
+
+    if ! mariadb-admin ping -h "$DB_HOST" --silent 2>/dev/null; then
+        fail 3 "Database host ${DB_HOST} not reachable"
+    fi
+
+    log "Database is responsive"
+}
+
+# -----------------------------------------------------------------------------
+# Prepare Staging Directory Structure
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Update directory list to match your service.
+prepare_staging() {
+    log "Preparing staging directories"
+
+    # Clean existing content using privileged helper
+    # CUSTOMIZATION: Add all directories your service uses
+    for dir in "$META_DIR"; do
+        if [[ -d "$dir" ]]; then
+            cleanup_staging "$dir"
+        fi
+    done
+    for dir in "$DB_DIR"; do
+        if [[ -d "$dir" ]]; then
+            cleanup_staging "$dir"
+        fi
+    done
+
+    # Create directory structure
+    ensure_staging_dir "$META_DIR"
+    ensure_staging_dir "$DB_DIR"
+
+    log "Staging directories ready"
+}
+
+# -----------------------------------------------------------------------------
+# Record Backup Metadata
+# -----------------------------------------------------------------------------
+# CUSTOMIZATION: Add service-specific metadata fields.
+record_metadata() {
+    log "Recording backup metadata"
+
+    local run_id
+    run_id="$(date -Is | tr ':' '-')"
+
+    printf '%s\n' "$run_id" > "${META_DIR}/run_id"
+    date -Is > "${META_DIR}/started_at"
+
+    printf '%s\n' "$DB_HOST" > "${META_DIR}/db_host"
+    printf '%s\n' "$DB_NAME" > "${META_DIR}/db_name"
+
+    log "Metadata recorded (run_id: $run_id)"
+}
+
+# -----------------------------------------------------------------------------
+# Dump Database
+# -----------------------------------------------------------------------------
+dump_database() {
+    PHASE="db_dump"
+    log "Dumping database"
+
+    timer_start "db_dump"
+
+    local dump_errors
+    dump_errors=$(mktemp) || fail 5 "Failed to create temp file for error capture"
+    register_cleanup "rm -f '$dump_errors'"
+
+    local db_file="${DB_DIR}/mariadb.sql.zst"
+
+    if ! mariadb-dump \
+        --single-transaction \
+        --routines \
+        --events \
+        --triggers \
+        -h "$DB_HOST" \
+        -u "$BACKUP_USER" \
+        "$DB_NAME" 2>"$dump_errors" \
+        | zstd -19 -T0 > "$db_file"; then
+
+        if [[ -s "$dump_errors" ]]; then
+            error "mariadb-dump stderr:"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$dump_errors"
+        fi
+        fail 5 "Failed to dump database"
+    fi
+
+    # Check for warnings even on success
+    if [[ -s "$dump_errors" ]]; then
+        warn "mariadb-dump produced warnings:"
+        while IFS= read -r line; do
+            warn "  $line"
+        done < "$dump_errors"
+    fi
+
+    # Generate checksum
+    (cd "$DB_DIR" && sha256sum -b "mariadb.sql.zst" > "mariadb.sql.zst.sha256")
+
+    timer_log "db_dump" "Database dump completed"
+}
+
+# -----------------------------------------------------------------------------
+# Generate Backup Summary
+# -----------------------------------------------------------------------------
+# Produces human-readable summary for logs and diagnostics.
+# CUSTOMIZATION: Add service-specific summary items.
+generate_summary() {
+    PHASE="summary"
+    log "Generating backup summary"
+
+    log "=== Backup Summary ==="
+    log "Staging directory: ${STAGING_DIR}"
+    log "View directory:    ${VIEW_DIR}"
+
+    log "Database:          ${DB_NAME}@${DB_HOST}"
+
+    if [[ -f "${DB_DIR}/mariadb.sql.zst" ]]; then
+        log_indent "mariadb.sql.zst: $(du -h "${DB_DIR}/mariadb.sql.zst" | cut -f1)"
+    fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+main() {
+    log "==== ${SCRIPT_NAME} started ===="
+    timer_start "total"
+
+    # -------------------------------------------------------------------------
+    # Phase: Lock Acquisition
+    # -------------------------------------------------------------------------
+    acquire_lock
+
+    # -------------------------------------------------------------------------
+    # Phase: Prerequisite Validation
+    # -------------------------------------------------------------------------
+    PHASE="validate"
+
+    # Required commands (host)
+    require_command incus
+    require_command sha256sum
+    require_command mariadb-admin
+    require_command mariadb-dump
+    require_command zstd
+
+    check_database
+
+    # -------------------------------------------------------------------------
+    # Phase: Staging Preparation
+    # -------------------------------------------------------------------------
+    PHASE="prepare"
+    prepare_staging
+    record_metadata
+
+    # -------------------------------------------------------------------------
+    # Phase: Bind Mount Setup
+    # -------------------------------------------------------------------------
+    PHASE="bind_mount_prepare"
+    ensure_bind_mount "$STAGING_ROOT" "$VIEW_ROOT"
+
+    # -------------------------------------------------------------------------
+    # Phase: Database Dump
+    # -------------------------------------------------------------------------
+    dump_database
+
+    # -------------------------------------------------------------------------
+    # Phase: Summary
+    # -------------------------------------------------------------------------
+    generate_summary
+
+    timer_log "total" "Pre-backup completed"
+
+    # Exit handled by on_exit trap (which runs registered cleanup actions)
+}
+
+main "$@"

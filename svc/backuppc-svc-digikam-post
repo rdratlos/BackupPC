@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Digikam Service Backup — Post-Hook for BackupPC
+# /usr/local/sbin/backuppc-svc-digikam-post
+# =============================================================================
+#
+# Post hook for BackupPC *service backups* of the Digikam service.
+# Validates backup artifacts, records status, and manages cleanup.
+#
+# Responsibilities:
+#   • Validate staged artifacts (DB dump)
+#   • Record meta information (status, error, timestamps, xferOK)
+#   • On success: unmount BackupPC view and remove staging
+#   • On failure or xferOK!=1: keep bind mount + staging as evidence
+#
+# Command contract (BackupPC):
+#   DumpPostUserCmd should invoke this script with:
+#     backuppc-svc-digikam-post <cmdType> <xferOK>
+#   where:
+#     cmdType : BackupPC command type (string)
+#     xferOK  : 1=transfer ok, 0=transfer failed (may be empty in some paths)
+#
+# Key paths:
+#   • Staging (scratch): /export/mariadb/backuppc/services/digikam
+#   • BackupPC view:     /srv/backuppc/services/digikam
+#
+# Artifact validation (in priority order):
+#   CRITICAL (failure if invalid):
+#     • db/mariadb.sql.zst            - Database dump
+#
+#   ADVISORY (presence check only):
+#     • meta/                         - Backup metadata
+#
+# Preconditions:
+#   • The user "backuppc" must be allowed to bind mount and unmount
+#     the service staging directory.
+#
+#   • Sudoers rules must be in place (see doc/setup):
+#       backuppc ALL = NOPASSWD: /usr/bin/mount --bind /export/mariadb/backuppc/services /srv/backuppc/services
+#       backuppc ALL = NOPASSWD: /usr/bin/umount /srv/backuppc/services/digikam
+#       backuppc ALL = NOPASSWD: /usr/local/sbin/backuppc-staging-cleanup
+#
+# Exit codes:
+#   0  - Success
+#   1  - General error
+#   2  - Configuration/validation error
+#   3  - Staging operation failed
+#   4  - Container operation failed
+#   5  - Timeout
+#   10 - Lock acquisition failed
+#   100 - BackupPC transfer failed (xferOK=0)
+#
+# Note:
+#   This script is *not* a general host backup but a staging step for
+#   application-consistent service artifacts that BackupPC will ingest.
+#
+# =============================================================================
+
+# Source shared library
+source /usr/local/lib/backuppc/common.sh
+
+# Enable strict error handling
+enable_strict_traps
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# CUSTOMIZATION: These MUST match your pre-backup script paths exactly.
+
+# Service identification
+# CUSTOMIZATION REQUIRED: Set service name and container
+readonly SERVICE="digikam"
+
+# Paths
+readonly STAGING_ROOT="/export/mariadb/backuppc/services"
+readonly VIEW_ROOT="/srv/backuppc/services"
+
+readonly STAGING_DIR="${STAGING_ROOT}/${SERVICE}"
+readonly VIEW_DIR="${VIEW_ROOT}/${SERVICE}"
+
+readonly META_DIR="${STAGING_DIR}/meta"
+
+# Artifact paths
+readonly DB_DIR="${STAGING_DIR}/db"
+
+# Critical artifacts (must pass validation)
+readonly CRITICAL_DUMP="${DB_DIR}/mariadb.sql.zst"
+
+# =============================================================================
+# POST-SCRIPT EXIT HANDLER
+# =============================================================================
+# Custom exit handler that:
+#   1. Writes meta information (always)
+#   2. Writes final status based on FAILED and xferOK
+#   3. Finalizes mount and staging (cleanup on success, preserve on failure)
+
+post_exit_handler() {
+    local rc=$?
+
+    # Disable ERR trap during cleanup
+    trap - ERR
+
+    # If we're exiting due to a failure, use the captured code
+    local final_rc="$rc"
+    if [[ "$FAILED" -ne 0 ]]; then
+        final_rc="$FAIL_RC"
+    fi
+
+    # Always write meta information
+    write_meta_xferok "$META_DIR"
+
+    # Write final status
+    if [[ "$FAILED" -ne 0 ]]; then
+        write_meta_status "$META_DIR" "failed" "${FAIL_MSG:-unknown error}"
+        error "POST backup failed: ${FAIL_MSG:-unknown error}"
+    elif [[ "$XFER_OK" -ne 1 ]]; then
+        write_meta_status "$META_DIR" "failed" "xferOK=${XFER_OK}: BackupPC transfer failed"
+        error "BackupPC transfer failed (xferOK=${XFER_OK})"
+        FAILED=1
+        final_rc=100
+    else
+        write_meta_status "$META_DIR" "ok"
+        log "All checks OK and BackupPC transfer OK (xferOK=1)"
+    fi
+
+    # Finalize mount and staging based on success/failure
+    finalize_mount_and_staging
+
+    # Final log message
+    if [[ "$FAILED" -ne 0 ]]; then
+        error "==== ${SCRIPT_NAME} FAILED ===="
+    else
+        log "==== ${SCRIPT_NAME} completed successfully ===="
+    fi
+
+    exit "$final_rc"
+}
+
+# =============================================================================
+# STAGING FINALIZATION
+# =============================================================================
+
+finalize_mount_and_staging() {
+    # Policy:
+    #   • If FAILED != 0 OR xferOK != 1: keep bind mount + staging for evidence
+    #   • If success AND xferOK == 1: unmount view + remove staging
+
+    if should_preserve_staging; then
+        warn "Failure detected; checking evidence preservation status"
+
+        # Report actual state of staging
+        if [[ -d "$STAGING_DIR" ]]; then
+            warn "  Staging preserved: ${STAGING_DIR}"
+        else
+            warn "  Staging not found: ${STAGING_DIR} (already removed?)"
+        fi
+
+        # Report actual state of view/mount
+        local mount_status
+        mount_status=$(findmnt -n -o SOURCE --mountpoint "$VIEW_ROOT" 2>/dev/null) || true
+        if [[ -n "$mount_status" ]]; then
+            warn "  View mounted: ${VIEW_ROOT} (source: ${mount_status})"
+        elif [[ -d "$VIEW_ROOT" ]]; then
+            warn "  View exists but not mounted: ${VIEW_ROOT}"
+        else
+            warn "  View not found: ${VIEW_ROOT}"
+        fi
+
+        return 0
+    fi
+
+    # Success path: cleanup
+    PHASE="cleanup_success"
+
+    # Remove bind mount (safe - won't fail script)
+    remove_bind_mount "$VIEW_ROOT"
+
+    # Remove staging directory contents
+    log "Removing staging directory: ${STAGING_DIR}"
+    if ! cleanup_staging "$STAGING_DIR"; then
+        # This is unexpected on success - make it visible
+        error "Failed to remove staging directory: ${STAGING_DIR}"
+        # Don't fail the script - BackupPC transfer succeeded
+    fi
+
+    # Optional: remove empty view dir
+    rmdir "$VIEW_DIR" 2>/dev/null || true
+}
+
+# =============================================================================
+# ARTIFACT VALIDATION
+# =============================================================================
+
+validate_critical_artifacts() {
+    local errors=0
+
+    log "Validating critical artifacts"
+
+    # Pattern: Check zstd integrity, then checksum if present
+    PHASE="validate_critical_dump"
+    if ! verify_zstd_file "$CRITICAL_DUMP" "Digikam database dump"; then
+        errors=$((errors + 1))
+    else
+        # Also verify checksum if present
+        if ! verify_file_checksum "$CRITICAL_DUMP"; then
+            errors=$((errors + 1))
+        fi
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        fail 10 "Critical artifact validation failed ($errors error(s))"
+    fi
+
+    log "Critical artifacts validated successfully"
+}
+
+validate_advisory_artifacts() {
+    PHASE="validate_advisory"
+
+    log "Checking advisory artifacts"
+
+    # Meta directory (should exist from pre-script)
+    verify_directory_exists "$META_DIR" "Backup metadata" || true
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+    log "==== POST backup start ===="
+
+    # Initialize xferOK from BackupPC arguments
+    # Note: First arg is expected cmdType for validation, then actual $1 and $2
+    init_xfer_status "DumpPostUserCmd" "${1:-}" "${2:-}"
+    log "BackupPC xferOK=${XFER_OK}"
+
+    # Validate staging directory exists
+    PHASE="validate_staging"
+    if [[ ! -d "$STAGING_DIR" ]]; then
+        fail 2 "Staging directory not found: $STAGING_DIR"
+    fi
+
+    # Validate critical artifacts (fails on error)
+    validate_critical_artifacts
+
+    # Check advisory artifacts (informational)
+    validate_advisory_artifacts
+
+    PHASE="done"
+    log "Post script validation complete"
+
+    # Exit handler will finalize based on xferOK and internal status
+}
+
+# Install our custom exit handler (overrides common.sh on_exit)
+trap 'post_exit_handler' EXIT
+
+# Run main with command line arguments
+main "$@"
