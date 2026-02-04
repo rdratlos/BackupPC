@@ -7,31 +7,31 @@ Extend BackupPC with service-centric backup capabilities for containerized appli
 This suite extends [BackupPC](https://backuppc.github.io/backuppc/) beyond traditional host/VM backups to provide **application-consistent service backups**. It captures not just files, but complete service state including database dumps, configuration, package lists, and metadata—everything needed for disaster recovery.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        BackupPC Services Architecture                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   BackupPC Server          Staging Layer              Containers/Services    │
-│   ───────────────          ─────────────              ──────────────────     │
-│                                                                              │
-│   ┌─────────────┐    ┌─────────────────────┐    ┌─────────────────────────┐ │
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                        BackupPC Services Architecture                         │
+├───────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│   BackupPC Server          Staging Layer              Containers/Services     │
+│   ───────────────          ─────────────              ──────────────────      │
+│                                                                               │
+│   ┌─────────────┐     ┌─────────────────────┐     ┌─────────────────────────┐ │
 │   │  BackupPC   │◀───│ /srv/backuppc/      │◀───│  Incus Containers       │ │
-│   │   Daemon    │    │  services/          │    │  ┌─────────────────────┐│ │
-│   │             │    │  ├─nextcloud/       │    │  │ nextcloud-server    ││ │
-│   │  rsync/tar  │    │  │ ├─config/        │◀───│──│ • /etc              ││ │
-│   │  pooling    │    │  │ ├─db/            │    │  │ • occ status        ││ │
-│   └─────────────┘    │  │ └─meta/          │    │  └─────────────────────┘│ │
-│         │            │  └─mariadb/         │    │  ┌─────────────────────┐│ │
-│         │            │    ├─server/        │◀───│──│ minerva (MariaDB)   ││ │
-│         ▼            │    │ └─db/binlogs   │    │  │ • mysql.* dump      ││ │
-│   DumpPreUserCmd     │    └─meta/          │    │  │ • binary logs       ││ │
-│   DumpPostUserCmd    └─────────────────────┘    │  └─────────────────────┘│ │
-│                              ▲                   └─────────────────────────┘ │
-│                              │                                               │
-│                        Bind Mount                                            │
-│                    /export/mariadb/backuppc/services                         │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+│   │   Daemon    │     │  services/          │     │  ┌─────────────────────┐│ │
+│   │             │     │  ├─nextcloud/       │     │  │ nextcloud-server    ││ │
+│   │  rsync/tar  │     │  │ ├─config/        │◀───│──│ • /etc              ││ │
+│   │  pooling    │     │  │ ├─db/            │     │  │ • occ status        ││ │
+│   └─────────────┘     │  │ └─meta/          │     │  └─────────────────────┘│ │
+│         │             │  └─mariadb/         │     │  ┌─────────────────────┐│ │
+│         │             │    ├─server/        │◀───│──│ minerva (MariaDB)   ││ │
+│         ▼             │    │ └─db/binlogs   │     │  │ • mysql.* dump      ││ │
+│   DumpPreUserCmd      │    └─meta/          │     │  │ • binary logs       ││ │
+│   DumpPostUserCmd     └─────────────────────┘     │  └─────────────────────┘│ │
+│                                 ▲                 └─────────────────────────┘ │
+│                                 │                                             │
+│                             Bind Mount                                        │
+│                    /export/mariadb/backuppc/services                          │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Key Features
