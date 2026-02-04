@@ -223,9 +223,26 @@ finalize_mount_and_staging() {
     #   • If success AND xferOK == 1: unmount view + remove staging
 
     if should_preserve_staging; then
-        warn "Preserving bind mount + staging for evidence"
-        warn "  View:    ${VIEW_DIR}"
-        warn "  Staging: ${STAGING_DIR}"
+        warn "Failure detected; checking evidence preservation status"
+
+        # Report actual state of staging
+        if [[ -d "$STAGING_DIR" ]]; then
+            warn "  Staging preserved: ${STAGING_DIR}"
+        else
+            warn "  Staging not found: ${STAGING_DIR} (already removed?)"
+        fi
+
+        # Report actual state of view/mount
+        local mount_status
+        mount_status=$(findmnt -n -o SOURCE --mountpoint "$VIEW_ROOT" 2>/dev/null) || true
+        if [[ -n "$mount_status" ]]; then
+            warn "  View mounted: ${VIEW_ROOT} (source: ${mount_status})"
+        elif [[ -d "$VIEW_ROOT" ]]; then
+            warn "  View exists but not mounted: ${VIEW_ROOT}"
+        else
+            warn "  View not found: ${VIEW_ROOT}"
+        fi
+
         return 0
     fi
 
@@ -234,7 +251,7 @@ finalize_mount_and_staging() {
 
     # Remove bind mount (safe - won't fail script)
     # CUSTOMIZATION: Use VIEW_DIR for service-specific mount or VIEW_ROOT for shared mount
-    remove_bind_mount "$VIEW_DIR"
+    remove_bind_mount "$VIEW_ROOT"
 
     # Remove staging directory contents
     log "Removing staging directory: ${STAGING_DIR}"
