@@ -24,7 +24,6 @@
 #   - backuppc-staging-cleanup helper
 #   - MySQL client tools (mariadb-admin, mariadb-dump)
 #   - zstd compression
-#   - incus (container management)
 #
 # Required MySQL grants for BackupOp user:
 #   GRANT SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER ON digikam.* TO 'BackupOp'@'...';
@@ -145,7 +144,7 @@ record_metadata() {
 # -----------------------------------------------------------------------------
 dump_database() {
     PHASE="db_dump"
-    log "Dumping database"
+    log "Dumping Digikam database"
 
     timer_start "db_dump"
 
@@ -171,7 +170,7 @@ dump_database() {
                 error "  $line"
             done < "$dump_errors"
         fi
-        fail 5 "Failed to dump database"
+        fail 5 "Failed to dump Digikam database"
     fi
 
     # Check for warnings even on success
@@ -226,11 +225,10 @@ main() {
     PHASE="validate"
 
     # Required commands (host)
-    require_command incus
-    require_command sha256sum
     require_command mariadb-admin
     require_command mariadb-dump
     require_command zstd
+    require_command sha256sum
 
     check_database
 
