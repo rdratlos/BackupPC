@@ -133,6 +133,12 @@ check_database() {
 prepare_staging() {
     log "Preparing staging directories"
 
+    # Repair traversal ACL on staging parent unconditionally — must happen
+    # before any mkdir. The [[ -d ]] guard cannot be used here because a
+    # broken ACL mask makes test -d return false for all paths underneath,
+    # which would prevent the repair from ever being triggered.
+    sudo backuppc-staging-cleanup "$CONFIG_DIR"
+
     # Clean existing content using privileged helper
     for dir in "$CONFIG_DIR" "$DB_DIR" "$META_DIR"; do
         if [[ -d "$dir" ]]; then
@@ -268,6 +274,7 @@ dump_system_database() {
         END AS uh
         FROM mysql.user
         WHERE user NOT IN ('mariadb.sys', 'mysql', '')
+          AND is_role = 'N'
         ORDER BY user, host;" 2>"$grants_errors"); then
         error "Failed to query user list:"
         while IFS= read -r line; do
@@ -324,6 +331,7 @@ dump_system_database() {
     done <<< "$users_list"
 
     log "Exported $user_count user(s)"
+    local role_count=0
 
     # Anonymous users (PAM) - separate section
     {
@@ -370,6 +378,63 @@ dump_system_database() {
         log "Exported $anon_count anonymous user(s)"
     fi
 
+    # Roles - separate section (SHOW CREATE ROLE, not SHOW CREATE USER)
+    {
+        echo "-- ============================================"
+        echo "-- Roles"
+        echo "-- ============================================"
+    } >> "$grants_file"
+
+    local roles_list
+    if ! roles_list=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -B -e "
+        SELECT user FROM mysql.user
+        WHERE is_role = 'Y'
+          AND user != 'PUBLIC'
+        ORDER BY user;" 2>"$grants_errors"); then
+        error "Failed to query roles list:"
+        while IFS= read -r line; do
+            error "  $line"
+        done < "$grants_errors"
+        fail 5 "Cannot retrieve roles list"
+    fi
+
+    while IFS= read -r role; do
+        [[ -z "$role" ]] && continue
+        role_count=$((role_count + 1))
+
+        {
+            echo "-- ============================================"
+            echo "-- Role: $role"
+            echo "-- ============================================"
+        } >> "$grants_file"
+
+        # SHOW CREATE ROLE does not exist in MariaDB - reconstruct from known facts:
+        # roles have no password, no host, no other attributes beyond their grants.
+        echo "CREATE ROLE IF NOT EXISTS \`${role}\`;" >> "$grants_file"
+
+        # SHOW GRANTS FOR role
+        rc=0
+        grants_out=$(mariadb --defaults-file="$MYSQL_CONFIG_FILE" -N -e \
+            "SHOW GRANTS FOR \`${role}\`;" 2>"$grants_errors") || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            error "SHOW GRANTS FOR role failed for '$role':"
+            while IFS= read -r line; do
+                error "  $line"
+            done < "$grants_errors"
+            fail 5 "Cannot show grants for role: $role"
+        fi
+
+        if [[ -n "$grants_out" ]]; then
+            echo "$grants_out" | sed 's/$/;/' >> "$grants_file"
+        fi
+        echo "" >> "$grants_file"
+
+    done <<< "$roles_list"
+
+    if [[ $role_count -gt 0 ]]; then
+        log "Exported $role_count role(s)"
+    fi
+
     # Proxy privileges
     {
         echo "-- ============================================"
@@ -393,7 +458,7 @@ dump_system_database() {
     fi
     echo "" >> "$grants_file"
 
-    log "Grants export complete: $grants_file"
+    log "Grants export complete: $user_count user(s), $role_count role(s) → $grants_file"
 }
 
 # Capture instance metadata

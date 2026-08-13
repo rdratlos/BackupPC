@@ -53,6 +53,7 @@ set -o pipefail     # Pipeline fails on first error
 readonly CONFIG="${BACKUPPC_STAGING_ROOTS_CONF:-/etc/backuppc/staging.conf}"
 readonly SCRIPT_NAME="${0##*/}"
 readonly MIN_DEPTH=2  # Minimum depth below staging root (e.g., /root/service)
+readonly BACKUPPC_USER="backuppc"
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -73,12 +74,35 @@ warn()  { _log WARN  "$@"; }
 error() { _log ERROR "$@"; }
 debug() { [[ "${DEBUG:-0}" == "1" ]] && _log DEBUG "$@" || true; }
 
+# System relevant event logging; use with care as outlined above.
+journal()
+{
+    logger -t "$SCRIPT_NAME" -- "$*"
+}
+
 # die: Exit with error (consistent with common.sh fail())
 die() {
     local rc="$1"
     shift
     error "$*"
     exit "$rc"
+}
+
+# -----------------------------------------------------------------------------
+# Validate BackupPC user
+# -----------------------------------------------------------------------------
+check_service_user()
+{
+    local user="$1"
+
+    if ! id "$user" >/dev/null 2>&1; then
+        error "Required service user does not exist: $user"
+        journal err "event=missing_user user=$user"
+        return 1
+    fi
+
+    debug "Service user exists: $user"
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -189,6 +213,49 @@ validate_path() {
     fi
 
     log "Path validated: $target (under $matched_root, depth $depth)"
+
+    printf '%s\n' "$matched_root"
+}
+
+# -----------------------------------------------------------------------------
+# Enforce access to BackupPC staging root folder for service user backuppc
+# -----------------------------------------------------------------------------
+ensure_acl_access()
+{
+    local user="$1"
+    local path="$2"
+
+    # Walk up the path to find the actual broken ancestor
+    local check_path="$path"
+    local broken_path=""
+
+    while [[ "$check_path" != "/" ]]; do
+        if ! sudo -u "$user" test -x "$check_path" 2>/dev/null; then
+            broken_path="$check_path"
+        else
+            break
+        fi
+        check_path=$(dirname "$check_path")
+    done
+
+    if [[ -z "$broken_path" ]]; then
+        debug "User $user already has traversal permission on $path"
+        return 0
+    fi
+
+    log "Repairing ACL mask on $broken_path (blocking access to $path)"
+
+    getfacl -cp "$broken_path" | logger -t backuppc-staging-acl
+
+    setfacl -m mask::x "$broken_path" || \
+        die 4 "Failed to repair ACL mask on $broken_path"
+
+    if ! sudo -u "$user" test -x "$path"; then
+        die 4 "ACL repair failed: $user still cannot access $path (repaired $broken_path)"
+    fi
+
+    log "ACL repair successful on $broken_path"
+    journal notice "event=acl_repair path=$broken_path user=$user"
 }
 
 # -----------------------------------------------------------------------------
@@ -247,6 +314,10 @@ EOF
 
     debug "Starting cleanup for: $target"
 
+    # Sanity check for BackupPC service user
+    check_service_user "$BACKUPPC_USER" || \
+        die 3 "Missing required service account: $BACKUPPC_USER"
+
     # Basic sanity checks before any filesystem operations
     if [[ -z "$target" || "$target" == "/" || "$target" == "." || "$target" == ".." ]]; then
         die 3 "Refusing dangerous target: '$target'"
@@ -278,7 +349,10 @@ EOF
     load_allowed_roots allowed_roots
 
     # Validate path against allowlist
-    validate_path "$real_target" "${allowed_roots[@]}"
+    STAGING_ROOT=$(validate_path "$real_target" "${allowed_roots[@]}")
+
+    # Ensure user backuppc has access to the staging root folder
+    ensure_acl_access "$BACKUPPC_USER" "$STAGING_ROOT"
 
     # Perform cleanup
     do_cleanup "$real_target"

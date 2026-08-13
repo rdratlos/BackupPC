@@ -135,6 +135,12 @@ check_database() {
 prepare_staging() {
     log "Preparing staging directories"
 
+    # Repair traversal ACL on staging parent unconditionally — must happen
+    # before any mkdir. The [[ -d ]] guard cannot be used here because a
+    # broken ACL mask makes test -d return false for all paths underneath,
+    # which would prevent the repair from ever being triggered.
+    sudo backuppc-staging-cleanup "$META_DIR"
+
     # Clean existing content using privileged helper
     for dir in "$CONFIG_DIR" "$DB_DIR" "$APP_DIR" "$APP_LIST_DIR" "$PACKAGE_DIR" "$SYSTEMD_DIR" "$META_DIR"; do
         if [[ -d "$dir" ]]; then
